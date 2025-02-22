@@ -50,5 +50,3 @@ impl From<String> for WholockError {
         WholockError::Other(error)
     }
 }
-
-pub type WholockResult<T> = Result<T, WholockError>; 

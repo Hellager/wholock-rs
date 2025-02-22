@@ -5,7 +5,7 @@ use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Threading::{OpenProcess, GetCurrentProcess, TerminateProcess};
 use windows::Win32::Storage::FileSystem::{ReOpenFile, FILE_SHARE_MODE, FILE_FLAGS_AND_ATTRIBUTES};
 use itertools::Itertools;
-use crate::error::{WholockError, WholockResult};
+use crate::error::WholockError;
 use crate::interop::{
     SYSTEM_EXTENDED_HANDLE_INFORMATION,
     PROCESS_ACCESS_RIGHTS_DUP_HANDLE,
@@ -18,6 +18,8 @@ use crate::interop::{
     get_handle_owner_info
 };
 
+pub type WholockResult<T> = Result<T, WholockError>; 
+
 #[derive(Debug)]
 pub struct ProcessInfo {
     pub pid: u32,
@@ -28,8 +30,6 @@ pub struct ProcessInfo {
 }
 
 pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
-    use log::debug;
-
     let current_process: windows::Win32::Foundation::HANDLE = unsafe {
         GetCurrentProcess()
     };
@@ -81,7 +81,6 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
 
                 if let Ok(full_name) = get_final_path_name_by_handle(reopened_handle.as_ref().unwrap()) {
                     if check_if_locked_file(&full_name, path) {
-                        debug!("file locked find for {}", full_name);
                         process_info.locked_file.push(full_name);
                     }
                 }

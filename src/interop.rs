@@ -15,7 +15,7 @@ use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_HANDLE_OPTIONS};
 use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, GETFINALPATHNAMEBYHANDLE_FLAGS};
 use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
 use windows::Win32::Security::{LookupAccountSidW, SID_NAME_USE};
-use crate::error::{WholockError, WholockResult};
+use crate::{error::WholockError, WholockResult};
 
 pub(crate) const SYSTEM_EXTENDED_HANDLE_INFORMATION: SYSTEM_INFORMATION_CLASS = SYSTEM_INFORMATION_CLASS(0x40);
 pub(crate) const PROCESS_ACCESS_RIGHTS_DUP_HANDLE: PROCESS_ACCESS_RIGHTS = PROCESS_ACCESS_RIGHTS(0x0040);
@@ -27,7 +27,6 @@ pub(crate) struct SystemHandleInformationEx {
     handles: [SystemHandleTableEntryInfoEx; 1],
 }
 
-#[derive(Clone)]
 pub(crate) struct SystemHandleTableEntryInfoEx {
     #[allow(dead_code)]
     object: *mut c_void,
@@ -44,24 +43,9 @@ pub(crate) struct SystemHandleTableEntryInfoEx {
     _reserved: c_ulong,
 }
 
-#[derive(Clone)]
 pub(crate) struct HandleEntry(SystemHandleTableEntryInfoEx);
 
 impl HandleEntry {
-    #[allow(dead_code)]
-    pub fn clone(&self) -> Self {
-        HandleEntry(SystemHandleTableEntryInfoEx {
-            object: self.0.object,
-            unique_process_id: self.0.unique_process_id,
-            handle_value: self.0.handle_value,
-            granted_access: self.0.granted_access,
-            creator_back_trace_index: self.0.creator_back_trace_index,
-            object_type_index: self.0.object_type_index,
-            handle_attributes: self.0.handle_attributes,
-            _reserved: self.0._reserved,
-        })
-    }
-
     #[allow(dead_code)]
     fn object(&self) -> *mut c_void {
         self.0.object
