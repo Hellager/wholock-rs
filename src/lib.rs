@@ -15,7 +15,8 @@ use crate::interop::{
     duplicate_handle,
     get_final_path_name_by_handle,
     check_if_locked_file,
-    get_handle_owner_info
+    get_handle_owner_info,
+    get_process_info
 };
 
 pub type WholockResult<T> = Result<T, WholockError>; 
@@ -93,15 +94,10 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
 
             if process_info.locked_file.len() > 0 {
                 process_info.domain_username = get_handle_owner_info(open_process).unwrap();
-                
-                let s = sysinfo::System::new_all();
-                if let Some(_process) = s.process(sysinfo::Pid::from(pid)) {
-                    if let Some(exe_path) = _process.exe() {
-                        process_info.process_exe_path = exe_path.to_str().unwrap().to_string();
-                    }
+                let (name, path) = get_process_info(pid as u32).unwrap();
 
-                    process_info.process_name = _process.name().to_str().unwrap().to_string();
-                }
+                process_info.process_name = name;
+                process_info.process_exe_path = path;   
 
                 result.push(process_info);
             }

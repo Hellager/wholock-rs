@@ -10,12 +10,12 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::{Wdk::System::SystemInformation::{
     NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS,
 }, Win32::Foundation::WIN32_ERROR};
-use windows::Win32::System::Threading::{PROCESS_ACCESS_RIGHTS, OpenProcessToken};
-use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_HANDLE_OPTIONS};
+use windows::Win32::System::Threading::{PROCESS_ACCESS_RIGHTS, OpenProcessToken, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
+use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_HANDLE_OPTIONS, CloseHandle, MAX_PATH};
 use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, GETFINALPATHNAMEBYHANDLE_FLAGS};
 use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
 use windows::Win32::Security::{LookupAccountSidW, SID_NAME_USE};
-use crate::{error::WholockError, WholockResult};
+use crate::{error::WholockError, WholockResult, error::get_win32_error_message};
 
 pub(crate) const SYSTEM_EXTENDED_HANDLE_INFORMATION: SYSTEM_INFORMATION_CLASS = SYSTEM_INFORMATION_CLASS(0x40);
 pub(crate) const PROCESS_ACCESS_RIGHTS_DUP_HANDLE: PROCESS_ACCESS_RIGHTS = PROCESS_ACCESS_RIGHTS(0x0040);
@@ -293,6 +293,79 @@ pub(crate) fn build_process_name_dict() -> WholockResult<std::collections::HashM
     Ok(process_name_dict)
 }
 
+struct SafeHandle(HANDLE);
+
+impl SafeHandle {
+    fn new(handle: HANDLE) -> WholockResult<Self> {
+        if handle.is_invalid() {
+            return Err(WholockError::HandleError("Invalid handle".to_string()));
+        }
+        Ok(Self(handle))
+    }
+
+    fn as_raw(&self) -> HANDLE {
+        self.0
+    }
+}
+
+impl Drop for SafeHandle {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                if let Err(e) = CloseHandle(self.0) {
+                    log::error!("Failed to close handle: {}", 
+                        get_win32_error_message(&WIN32_ERROR(e.code().0 as u32))
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn convert_wide_buffer(buffer: &[u16], len: usize) -> WholockResult<String> {
+    let os_str = OsString::from_wide(&buffer[..len]);
+    os_str.into_string()
+        .map_err(|_| WholockError::EncodingError("Invalid UTF-16 sequence".to_string()))
+}
+
+fn extract_filename(path: &str) -> WholockResult<String> {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| WholockError::PathError("Invalid file path".to_string()))
+}
+
+pub(crate) fn get_process_info(pid: u32) -> WholockResult<(String, String)> {
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .map_err(|e| WholockError::ProcessError(
+                format!("Failed to open process {}: {}", 
+                    pid, 
+                    get_win32_error_message(&WIN32_ERROR(e.code().0 as u32))
+                )
+            ))?;
+
+        let safe_handle = SafeHandle::new(handle)?;
+
+        let mut buffer = [0u16; MAX_PATH as usize + 1];
+        let mut size = buffer.len() as u32;
+        
+        QueryFullProcessImageNameW(
+            safe_handle.as_raw(),
+            windows::Win32::System::Threading::PROCESS_NAME_FORMAT(0),
+            PWSTR::from_raw(buffer.as_mut_ptr()),
+            &mut size,
+        )
+        .map_err(|e| WholockError::Win32Error(WIN32_ERROR(e.code().0 as u32)))?;
+
+        let path_str = convert_wide_buffer(&buffer, size as usize)?;
+        let exe_name = extract_filename(&path_str)?;
+
+        Ok((exe_name, path_str))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,5 +438,46 @@ mod tests {
         assert!(result.is_ok());
         let dict = result.unwrap();
         assert!(!dict.is_empty());
+    }
+
+    #[test]
+    fn test_convert_wide_buffer() {
+        let test_str = "Hello, 世界";
+        let wide: Vec<u16> = test_str.encode_utf16().collect();
+        let result = convert_wide_buffer(&wide, wide.len());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), test_str);
+
+        let invalid_utf16 = vec![0xD800];
+        let result = convert_wide_buffer(&invalid_utf16, invalid_utf16.len());
+        assert!(matches!(result, Err(WholockError::EncodingError(_))));
+    }
+
+    #[test]
+    fn test_extract_filename() {
+        let path = r"C:\Users\test\file.txt";
+        let result = extract_filename(path);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "file.txt");
+
+        let invalid_path = "";
+        let result = extract_filename(invalid_path);
+        assert!(matches!(result, Err(WholockError::PathError(_))));
+    }
+
+    #[test_log::test]
+    fn test_current_process() {
+        let pid = std::process::id();
+        let (name, path) = get_process_info(pid).unwrap();
+        assert!(!name.is_empty());
+        assert!(std::path::Path::new(&path).exists());
+        assert_eq!(
+            name,
+            std::path::Path::new(&path)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
     }
 }
