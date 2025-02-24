@@ -200,8 +200,15 @@ pub(crate) fn get_final_path_name_by_handle(h_file: &HANDLE) -> WholockResult<St
     })
 }
 
+fn normalize_path(path: &str) -> String {
+    path.replace('/', "\\")
+        .to_lowercase()
+        .trim_start_matches(r"\\?\")
+        .to_string()
+}
+
 pub(crate) fn check_if_locked_file(path: &str, target_path: &str) -> bool {
-    path.to_lowercase().starts_with(&target_path.to_lowercase())
+    normalize_path(path) == normalize_path(target_path)
 }
 
 pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
