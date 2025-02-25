@@ -23,7 +23,12 @@ impl fmt::Display for WholockError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WholockError::WindowsError(e) => write!(f, "Windows API error: {}", e),
-            WholockError::Win32Error(e) => write!(f, "Win32 error code {}: {}", e.0, get_win32_error_message(e)),
+            WholockError::Win32Error(e) => write!(
+                f,
+                "Win32 error code {}: {}",
+                e.0,
+                get_win32_error_message(e)
+            ),
             WholockError::IoError(e) => write!(f, "IO error: {}", e),
             WholockError::SystemInfoError(e) => write!(f, "System info error: {}", e),
             WholockError::HandleError(e) => write!(f, "Handle operation error: {}", e),
@@ -38,9 +43,9 @@ impl fmt::Display for WholockError {
 }
 
 pub(crate) fn get_win32_error_message(error: &WIN32_ERROR) -> String {
-    use windows::Win32::System::Diagnostics::Debug::{FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM};
     use windows::core::PWSTR;
-    
+    use windows::Win32::System::Diagnostics::Debug::{FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM};
+
     let mut buffer = [0u16; 512];
     unsafe {
         let size = FormatMessageW(
@@ -55,7 +60,9 @@ pub(crate) fn get_win32_error_message(error: &WIN32_ERROR) -> String {
         if size == 0 {
             return format!("Unknown error {}", error.0);
         }
-        String::from_utf16_lossy(&buffer[..size as usize]).trim().to_string()
+        String::from_utf16_lossy(&buffer[..size as usize])
+            .trim()
+            .to_string()
     }
 }
 
