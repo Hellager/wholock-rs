@@ -1,7 +1,7 @@
 pub mod error;
 mod interop;
 
-use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{HANDLE, CloseHandle};
 use windows::Win32::System::Threading::{OpenProcess, GetCurrentProcess, TerminateProcess};
 use windows::Win32::Storage::FileSystem::{ReOpenFile, FILE_SHARE_MODE, FILE_FLAGS_AND_ATTRIBUTES};
 use itertools::Itertools;
@@ -28,6 +28,30 @@ pub struct ProcessInfo {
     pub process_exe_path: String,
     pub domain_username: String,
     pub locked_file: Vec<String>
+}
+
+struct HandleWrapper(HANDLE);
+
+impl HandleWrapper {
+    fn new(handle: HANDLE) -> Self {
+        HandleWrapper(handle)
+    }
+    
+    fn get(&self) -> HANDLE {
+        self.0
+    }
+    
+    fn is_invalid(&self) -> bool {
+        self.0.is_invalid()
+    }
+}
+
+impl Drop for HandleWrapper {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe { let _ = CloseHandle(self.0); }
+        }
+    }
 }
 
 pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
@@ -60,36 +84,30 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
         
             for handle in handles.iter() {
                 let handle_entry = *handle;
-                let dup_handle = duplicate_handle(current_process, open_process, handle_entry)?;
+                let dup_handle = HandleWrapper::new(duplicate_handle(current_process, open_process, handle_entry)?);
                 if dup_handle.is_invalid() {
                     continue;
                 }
             
                 let reopened_handle = unsafe { 
                     ReOpenFile(
-                        dup_handle,
+                        dup_handle.get(),
                         0, 
                         FILE_SHARE_MODE(0), 
                         FILE_FLAGS_AND_ATTRIBUTES(0)) 
                 };
 
                 if reopened_handle.is_err() || reopened_handle.as_ref().unwrap().is_invalid() {
-                    unsafe { 
-                        let _ = CloseHandle(dup_handle);
-                    };
                     continue;
                 }
 
-                if let Ok(full_name) = get_final_path_name_by_handle(reopened_handle.as_ref().unwrap()) {
+                let reopened_handle = HandleWrapper::new(reopened_handle.unwrap());
+
+                if let Ok(full_name) = get_final_path_name_by_handle(&reopened_handle.get()) {
                     if check_if_locked_file(&full_name, path) {
                         process_info.locked_file.push(full_name);
                     }
                 }
-
-                unsafe {
-                    let _ = CloseHandle(reopened_handle.unwrap());
-                    let _ = CloseHandle(dup_handle);              
-                };
             }
 
             if process_info.locked_file.len() > 0 {
