@@ -1,9 +1,9 @@
-use wholock::{who_locks_file, unlock_file};
 use std::env;
+use wholock::{unlock_file, who_locks_file};
 
 fn main() {
     env_logger::init();
-    
+
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         println!("Usage: {} <file_path> [--unlock]", args[0]);
@@ -22,7 +22,7 @@ fn main() {
 
             println!("\nProcesses locking the file {}:", file_path);
             println!("{:-<50}", "");
-            
+
             for process in &processes {
                 println!("PID: {}", process.pid);
                 println!("Process Name: {}", process.process_name);
@@ -35,7 +35,10 @@ fn main() {
                 println!("{:-<50}", "");
 
                 if should_unlock {
-                    println!("Attempting to unlock by terminating process {}...", process.pid);
+                    println!(
+                        "Attempting to unlock by terminating process {}...",
+                        process.pid
+                    );
                     match unlock_file(process.pid) {
                         Ok(_) => println!("Successfully terminated process {}", process.pid),
                         Err(e) => eprintln!("Failed to terminate process {}: {}", process.pid, e),
