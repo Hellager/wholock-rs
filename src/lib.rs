@@ -54,6 +54,40 @@ impl Drop for HandleWrapper {
     }
 }
 
+/// Identifies all processes that have locked a specified file
+///
+/// This function works by enumerating all handles in the system and identifying
+/// processes that currently have locks on the specified file path.
+///
+/// # Arguments
+///
+/// * `path` - The path to the file to check, can be relative or absolute
+///
+/// # Returns
+///
+/// Returns `WholockResult<Vec<ProcessInfo>>` containing information about all processes
+/// that have locked the file. Each `ProcessInfo` includes process ID, name, executable path,
+/// user information, and a list of locked file paths.
+///
+/// # Errors
+///
+/// Returns a `WholockError` if system handle information cannot be queried or if other
+/// errors occur during processing.
+///
+/// # Examples
+///
+/// ```no_run
+/// use wholock::{who_locks_file, ProcessInfo};
+///
+/// match who_locks_file("C:\\path\\to\\file.txt") {
+///     Ok(processes) => {
+///         for process in processes {
+///             println!("Process {} ({}) has locked the file", process.process_name, process.pid);
+///         }
+///     },
+///     Err(e) => println!("Error occurred: {:?}", e),
+/// }
+/// ```
 pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
     let current_process: windows::Win32::Foundation::HANDLE = unsafe {
         GetCurrentProcess()
@@ -133,6 +167,43 @@ fn sanitize_pid(pid: u32) -> WholockResult<()> {
     Ok(())
 }
 
+/// Terminates a process to unlock files held by that process
+///
+/// This function forcibly terminates the specified process, which will release
+/// any file locks held by that process. Use with caution as terminating processes
+/// can lead to data loss if the process was in the middle of writing data.
+///
+/// # Arguments
+///
+/// * `pid` - The process ID of the process to terminate
+///
+/// # Returns
+///
+/// Returns `WholockResult<()>` indicating success or failure
+///
+/// # Errors
+///
+/// Returns a `WholockError` if:
+/// - The provided PID is invalid or doesn't exist
+/// - The process cannot be opened with termination rights
+/// - The process termination fails
+///
+/// # Examples
+///
+/// ```no_run
+/// use wholock::{who_locks_file, unlock_file};
+///
+/// // Find processes locking a file
+/// let processes = who_locks_file("C:\\path\\to\\file.txt").unwrap();
+/// 
+/// // Terminate the first process found
+/// if let Some(process) = processes.first() {
+///     match unlock_file(process.pid) {
+///         Ok(_) => println!("Successfully terminated process {}", process.pid),
+///         Err(e) => println!("Failed to terminate process: {:?}", e),
+///     }
+/// }
+/// ```
 pub fn unlock_file(pid: u32) -> WholockResult<()> {
     use windows::Win32::System::Threading::PROCESS_TERMINATE;
 
