@@ -1,25 +1,39 @@
+use crate::{error::get_win32_error_message, error::WholockError, WholockResult};
 use std::{
     ffi::{c_void, OsString},
     mem,
-    os::{raw::{c_ulong, c_ushort}, windows::ffi::OsStringExt},
+    os::{
+        raw::{c_ulong, c_ushort},
+        windows::ffi::OsStringExt,
+    },
     ptr::{self, addr_of},
     slice,
 };
-use windows::Win32::Foundation::HANDLE;
 use windows::core::{PCWSTR, PWSTR};
-use windows::{Wdk::System::SystemInformation::{
-    NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS,
-}, Win32::Foundation::WIN32_ERROR};
-use windows::Win32::System::Threading::{PROCESS_ACCESS_RIGHTS, OpenProcessToken, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
-use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_HANDLE_OPTIONS, CloseHandle, MAX_PATH};
-use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, GETFINALPATHNAMEBYHANDLE_FLAGS};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{
+    CloseHandle, DuplicateHandle, DUPLICATE_HANDLE_OPTIONS, MAX_PATH,
+};
 use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
 use windows::Win32::Security::{LookupAccountSidW, SID_NAME_USE};
-use crate::{error::WholockError, WholockResult, error::get_win32_error_message};
+use windows::Win32::Storage::FileSystem::{
+    GetFinalPathNameByHandleW, GETFINALPATHNAMEBYHANDLE_FLAGS,
+};
+use windows::Win32::System::Threading::{
+    OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_ACCESS_RIGHTS,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
+use windows::{
+    Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS},
+    Win32::Foundation::WIN32_ERROR,
+};
 
-pub(crate) const SYSTEM_EXTENDED_HANDLE_INFORMATION: SYSTEM_INFORMATION_CLASS = SYSTEM_INFORMATION_CLASS(0x40);
-pub(crate) const PROCESS_ACCESS_RIGHTS_DUP_HANDLE: PROCESS_ACCESS_RIGHTS = PROCESS_ACCESS_RIGHTS(0x0040);
-pub(crate) const PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION: PROCESS_ACCESS_RIGHTS = PROCESS_ACCESS_RIGHTS(0x0400);
+pub(crate) const SYSTEM_EXTENDED_HANDLE_INFORMATION: SYSTEM_INFORMATION_CLASS =
+    SYSTEM_INFORMATION_CLASS(0x40);
+pub(crate) const PROCESS_ACCESS_RIGHTS_DUP_HANDLE: PROCESS_ACCESS_RIGHTS =
+    PROCESS_ACCESS_RIGHTS(0x0040);
+pub(crate) const PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION: PROCESS_ACCESS_RIGHTS =
+    PROCESS_ACCESS_RIGHTS(0x0400);
 
 pub(crate) struct SystemHandleInformationEx {
     number_of_handles: usize,
@@ -74,7 +88,9 @@ impl HandleEntry {
     }
 }
 
-pub(crate) fn query_system_information_buffer(information_class: SYSTEM_INFORMATION_CLASS) -> WholockResult<Vec<u8>> {
+pub(crate) fn query_system_information_buffer(
+    information_class: SYSTEM_INFORMATION_CLASS,
+) -> WholockResult<Vec<u8>> {
     let mut buffer: Vec<u8> = vec![];
     loop {
         let mut return_length = 0;
@@ -96,7 +112,9 @@ pub(crate) fn query_system_information_buffer(information_class: SYSTEM_INFORMAT
                 buffer.reserve_exact(return_length);
                 buffer.resize(return_length, 0);
             } else {
-                return Err(WholockError::SystemInfoError("Failed to query system information".to_string()));
+                return Err(WholockError::SystemInfoError(
+                    "Failed to query system information".to_string(),
+                ));
             }
         }
     }
@@ -138,9 +156,10 @@ pub(crate) fn query_system_info() {
 pub(crate) fn duplicate_handle(
     current_process: windows::Win32::Foundation::HANDLE,
     handle_owner_process: windows::Win32::Foundation::HANDLE,
-    handle: &HandleEntry
+    handle: &HandleEntry,
 ) -> WholockResult<windows::Win32::Foundation::HANDLE> {
-    let mut target_handle: windows::Win32::Foundation::HANDLE = windows::Win32::Foundation::HANDLE(ptr::null_mut());
+    let mut target_handle: windows::Win32::Foundation::HANDLE =
+        windows::Win32::Foundation::HANDLE(ptr::null_mut());
     let result = unsafe {
         DuplicateHandle(
             handle_owner_process,
@@ -149,7 +168,7 @@ pub(crate) fn duplicate_handle(
             &mut target_handle,
             0,
             false,
-            DUPLICATE_HANDLE_OPTIONS(0)
+            DUPLICATE_HANDLE_OPTIONS(0),
         )
     };
 
@@ -158,19 +177,14 @@ pub(crate) fn duplicate_handle(
         Err(_) => {
             let err = unsafe { windows::Win32::Foundation::GetLastError() };
             Err(WholockError::Win32Error(err))
-        },
+        }
     }
 }
 
 pub(crate) fn get_final_path_name_by_handle(h_file: &HANDLE) -> WholockResult<String> {
     let mut buf = vec![0u16; 1024];
-    let mut result = unsafe {
-        GetFinalPathNameByHandleW(
-            *h_file,
-            &mut buf,
-            GETFINALPATHNAMEBYHANDLE_FLAGS(0),
-        )
-    };
+    let mut result =
+        unsafe { GetFinalPathNameByHandleW(*h_file, &mut buf, GETFINALPATHNAMEBYHANDLE_FLAGS(0)) };
 
     if result == 0 {
         return Err(WholockError::Win32Error(WIN32_ERROR(0x00000008)));
@@ -179,12 +193,8 @@ pub(crate) fn get_final_path_name_by_handle(h_file: &HANDLE) -> WholockResult<St
     if result as usize > buf.len() {
         buf.resize(result as usize, 0);
         result = unsafe {
-            GetFinalPathNameByHandleW(
-                *h_file,
-                &mut buf,
-                GETFINALPATHNAMEBYHANDLE_FLAGS(0),
-            )
-        }; 
+            GetFinalPathNameByHandleW(*h_file, &mut buf, GETFINALPATHNAMEBYHANDLE_FLAGS(0))
+        };
     }
 
     if result == 0 {
@@ -194,7 +204,10 @@ pub(crate) fn get_final_path_name_by_handle(h_file: &HANDLE) -> WholockResult<St
     let file_path = OsString::from_wide(&buf);
     let file_path = file_path.to_string_lossy().to_string();
     Ok(if file_path.starts_with(r"\\?\") {
-        file_path.strip_prefix(r"\\?\").unwrap_or(&file_path).to_string()
+        file_path
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&file_path)
+            .to_string()
     } else {
         file_path
     })
@@ -220,13 +233,7 @@ pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
         }
 
         let mut token_info_len = 0;
-        let _ = GetTokenInformation(
-            token_handle,
-            TokenUser,
-            None,
-            0,
-            &mut token_info_len
-        );
+        let _ = GetTokenInformation(token_handle, TokenUser, None, 0, &mut token_info_len);
 
         let mut token_info = vec![0u8; token_info_len as usize];
         if GetTokenInformation(
@@ -234,8 +241,10 @@ pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
             TokenUser,
             Some(token_info.as_mut_ptr() as *mut _),
             token_info_len,
-            &mut token_info_len
-        ).is_err() {
+            &mut token_info_len,
+        )
+        .is_err()
+        {
             return Err(std::io::Error::last_os_error().into());
         }
 
@@ -253,7 +262,7 @@ pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
             &mut name_size,
             PWSTR::null(),
             &mut domain_size,
-            &mut sid_type
+            &mut sid_type,
         );
 
         let mut name = vec![0u16; name_size as usize];
@@ -266,8 +275,10 @@ pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
             &mut name_size,
             PWSTR::from_raw(domain.as_mut_ptr()),
             &mut domain_size,
-            &mut sid_type
-        ).is_err() {
+            &mut sid_type,
+        )
+        .is_err()
+        {
             return Err(std::io::Error::last_os_error().into());
         }
 
@@ -285,7 +296,8 @@ pub(crate) fn build_process_name_dict() -> WholockResult<std::collections::HashM
     let mut sys = System::new_all();
     sys.refresh_all();
 
-    let mut process_name_dict: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    let mut process_name_dict: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
     for (pid, process) in sys.processes() {
         process_name_dict.insert((*pid).into(), process.name().to_string_lossy().to_string());
     }
@@ -313,7 +325,8 @@ impl Drop for SafeHandle {
         if !self.0.is_invalid() {
             unsafe {
                 if let Err(e) = CloseHandle(self.0) {
-                    log::error!("Failed to close handle: {}", 
+                    log::error!(
+                        "Failed to close handle: {}",
                         get_win32_error_message(&WIN32_ERROR(e.code().0 as u32))
                     );
                 }
@@ -324,7 +337,8 @@ impl Drop for SafeHandle {
 
 fn convert_wide_buffer(buffer: &[u16], len: usize) -> WholockResult<String> {
     let os_str = OsString::from_wide(&buffer[..len]);
-    os_str.into_string()
+    os_str
+        .into_string()
         .map_err(|_| WholockError::EncodingError("Invalid UTF-16 sequence".to_string()))
 }
 
@@ -338,19 +352,19 @@ fn extract_filename(path: &str) -> WholockResult<String> {
 
 pub(crate) fn get_process_info(pid: u32) -> WholockResult<(String, String)> {
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-            .map_err(|e| WholockError::ProcessError(
-                format!("Failed to open process {}: {}", 
-                    pid, 
-                    get_win32_error_message(&WIN32_ERROR(e.code().0 as u32))
-                )
-            ))?;
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).map_err(|e| {
+            WholockError::ProcessError(format!(
+                "Failed to open process {}: {}",
+                pid,
+                get_win32_error_message(&WIN32_ERROR(e.code().0 as u32))
+            ))
+        })?;
 
         let safe_handle = SafeHandle::new(handle)?;
 
         let mut buffer = [0u16; MAX_PATH as usize + 1];
         let mut size = buffer.len() as u32;
-        
+
         QueryFullProcessImageNameW(
             safe_handle.as_raw(),
             windows::Win32::System::Threading::PROCESS_NAME_FORMAT(0),
@@ -425,7 +439,7 @@ mod tests {
 
         let file = File::open(&file_path).unwrap();
         let handle = HANDLE(file.as_raw_handle() as _);
-        
+
         let result = get_final_path_name_by_handle(&handle);
         assert!(result.is_ok());
         let path = result.unwrap();
