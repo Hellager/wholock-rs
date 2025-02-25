@@ -1,6 +1,6 @@
 # Wholock-rs
 
-Read this in other languages: [English](README.md) | [中文](README.zh-CN.md)
+Read this in other languages: [English](README.md) | [中文](README.cn.md)
 
 ## Overview
 
