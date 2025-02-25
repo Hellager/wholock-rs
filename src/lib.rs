@@ -1,25 +1,19 @@
 pub mod error;
 mod interop;
 
-use windows::Win32::Foundation::{HANDLE, CloseHandle};
-use windows::Win32::System::Threading::{OpenProcess, GetCurrentProcess, TerminateProcess};
-use windows::Win32::Storage::FileSystem::{ReOpenFile, FILE_SHARE_MODE, FILE_FLAGS_AND_ATTRIBUTES};
-use itertools::Itertools;
 use crate::error::WholockError;
 use crate::interop::{
+    check_if_locked_file, duplicate_handle, get_final_path_name_by_handle, get_handle_owner_info,
+    get_handle_table, get_process_info, query_system_information_buffer,
+    PROCESS_ACCESS_RIGHTS_DUP_HANDLE, PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
     SYSTEM_EXTENDED_HANDLE_INFORMATION,
-    PROCESS_ACCESS_RIGHTS_DUP_HANDLE,
-    PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
-    query_system_information_buffer,
-    get_handle_table,
-    duplicate_handle,
-    get_final_path_name_by_handle,
-    check_if_locked_file,
-    get_handle_owner_info,
-    get_process_info
 };
+use itertools::Itertools;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Storage::FileSystem::{ReOpenFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, TerminateProcess};
 
-pub type WholockResult<T> = Result<T, WholockError>; 
+pub type WholockResult<T> = Result<T, WholockError>;
 
 #[derive(Debug)]
 pub struct ProcessInfo {
@@ -27,7 +21,7 @@ pub struct ProcessInfo {
     pub process_name: String,
     pub process_exe_path: String,
     pub domain_username: String,
-    pub locked_file: Vec<String>
+    pub locked_file: Vec<String>,
 }
 
 struct HandleWrapper(HANDLE);
@@ -36,11 +30,11 @@ impl HandleWrapper {
     fn new(handle: HANDLE) -> Self {
         HandleWrapper(handle)
     }
-    
+
     fn get(&self) -> HANDLE {
         self.0
     }
-    
+
     fn is_invalid(&self) -> bool {
         self.0.is_invalid()
     }
@@ -49,7 +43,9 @@ impl HandleWrapper {
 impl Drop for HandleWrapper {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
-            unsafe { let _ = CloseHandle(self.0); }
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
         }
     }
 }
@@ -89,20 +85,22 @@ impl Drop for HandleWrapper {
 /// }
 /// ```
 pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
-    let current_process: windows::Win32::Foundation::HANDLE = unsafe {
-        GetCurrentProcess()
-    };
+    let current_process: windows::Win32::Foundation::HANDLE = unsafe { GetCurrentProcess() };
     let mut result: Vec<ProcessInfo> = vec![];
 
     let buffer = query_system_information_buffer(SYSTEM_EXTENDED_HANDLE_INFORMATION)?;
     let table = get_handle_table(&buffer);
 
-    for (pid, handles) in table.iter().into_group_map_by(|elt| elt.unique_process_id()) {        
+    for (pid, handles) in table
+        .iter()
+        .into_group_map_by(|elt| elt.unique_process_id())
+    {
         if let Ok(open_process) = unsafe {
             OpenProcess(
-                PROCESS_ACCESS_RIGHTS_DUP_HANDLE | PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION, 
-                false, 
-                pid.try_into().unwrap())
+                PROCESS_ACCESS_RIGHTS_DUP_HANDLE | PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
+                false,
+                pid.try_into().unwrap(),
+            )
         } {
             if open_process.is_invalid() {
                 continue;
@@ -113,22 +111,27 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
                 process_name: "".to_string(),
                 process_exe_path: "".to_string(),
                 domain_username: "".to_string(),
-                locked_file: vec![]
+                locked_file: vec![],
             };
-        
+
             for handle in handles.iter() {
                 let handle_entry = *handle;
-                let dup_handle = HandleWrapper::new(duplicate_handle(current_process, open_process, handle_entry)?);
+                let dup_handle = HandleWrapper::new(duplicate_handle(
+                    current_process,
+                    open_process,
+                    handle_entry,
+                )?);
                 if dup_handle.is_invalid() {
                     continue;
                 }
-            
-                let reopened_handle = unsafe { 
+
+                let reopened_handle = unsafe {
                     ReOpenFile(
                         dup_handle.get(),
-                        0, 
-                        FILE_SHARE_MODE(0), 
-                        FILE_FLAGS_AND_ATTRIBUTES(0)) 
+                        0,
+                        FILE_SHARE_MODE(0),
+                        FILE_FLAGS_AND_ATTRIBUTES(0),
+                    )
                 };
 
                 if reopened_handle.is_err() || reopened_handle.as_ref().unwrap().is_invalid() {
@@ -149,7 +152,7 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
                 let (name, path) = get_process_info(pid as u32).unwrap();
 
                 process_info.process_name = name;
-                process_info.process_exe_path = path;   
+                process_info.process_exe_path = path;
 
                 result.push(process_info);
             }
@@ -161,7 +164,10 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
 
 fn sanitize_pid(pid: u32) -> WholockResult<()> {
     let system = sysinfo::System::new_all();
-    if !system.processes().contains_key(&sysinfo::Pid::from(pid as usize)) {
+    if !system
+        .processes()
+        .contains_key(&sysinfo::Pid::from(pid as usize))
+    {
         return Err(WholockError::InvalidPID(pid));
     }
     Ok(())
@@ -195,7 +201,7 @@ fn sanitize_pid(pid: u32) -> WholockResult<()> {
 ///
 /// // Find processes locking a file
 /// let processes = who_locks_file("C:\\path\\to\\file.txt").unwrap();
-/// 
+///
 /// // Terminate the first process found
 /// if let Some(process) = processes.first() {
 ///     match unlock_file(process.pid) {
@@ -212,7 +218,9 @@ pub fn unlock_file(pid: u32) -> WholockResult<()> {
     unsafe {
         let process_handle = OpenProcess(PROCESS_TERMINATE, false, pid)?;
         if process_handle.is_invalid() {
-            return Err(WholockError::HandleError("Failed to open process".to_string()));
+            return Err(WholockError::HandleError(
+                "Failed to open process".to_string(),
+            ));
         }
 
         if let Err(e) = TerminateProcess(process_handle, 1) {
@@ -230,23 +238,23 @@ mod tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
-    use tempfile::tempdir;
     use std::thread;
     use std::time::Duration;
+    use tempfile::tempdir;
 
     // This test is not ok for now
     #[test]
-    #[ignore] 
+    #[ignore]
     fn test_who_locks_file() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("locked.txt");
         let mut file = File::create(&file_path).unwrap();
         writeln!(file, "test content").unwrap();
-        
+
         let result = who_locks_file(file_path.to_str().unwrap());
         println!("result: {:?}", result);
         assert!(result.is_ok());
-        
+
         let processes = result.unwrap();
         assert!(!processes.is_empty());
 
@@ -265,7 +273,7 @@ mod tests {
         let child = Command::new("notepad.exe")
             .spawn()
             .expect("Failed to start test process");
-        
+
         let pid = child.id();
         thread::sleep(Duration::from_secs(1));
 
