@@ -13,6 +13,7 @@ pub enum WholockError {
     PathError(String),
     ProcessError(String),
     PermissionError(String),
+    InvalidPID(u32),
     Other(String),
 }
 
@@ -30,6 +31,7 @@ impl fmt::Display for WholockError {
             WholockError::PathError(e) => write!(f, "Path error: {}", e),
             WholockError::ProcessError(e) => write!(f, "Process error: {}", e),
             WholockError::PermissionError(e) => write!(f, "Permission error: {}", e),
+            WholockError::InvalidPID(e) => write!(f, "Invalid PID: {}", e),
             WholockError::Other(e) => write!(f, "{}", e),
         }
     }

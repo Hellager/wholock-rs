@@ -107,8 +107,18 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
     Ok(result)
 }
 
+fn sanitize_pid(pid: u32) -> WholockResult<()> {
+    let system = sysinfo::System::new_all();
+    if !system.processes().contains_key(&sysinfo::Pid::from(pid as usize)) {
+        return Err(WholockError::InvalidPID(pid));
+    }
+    Ok(())
+}
+
 pub fn unlock_file(pid: u32) -> WholockResult<()> {
     use windows::Win32::System::Threading::PROCESS_TERMINATE;
+
+    sanitize_pid(pid)?;
 
     unsafe {
         let process_handle = OpenProcess(PROCESS_TERMINATE, false, pid)?;
