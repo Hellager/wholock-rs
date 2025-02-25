@@ -194,7 +194,7 @@ pub(crate) fn get_final_path_name_by_handle(h_file: &HANDLE) -> WholockResult<St
     let file_path = OsString::from_wide(&buf);
     let file_path = file_path.to_string_lossy().to_string();
     Ok(if file_path.starts_with(r"\\?\") {
-        file_path[4..].to_string()
+        file_path.strip_prefix(r"\\?\").unwrap_or(&file_path).to_string()
     } else {
         file_path
     })

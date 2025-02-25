@@ -97,7 +97,7 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
     let buffer = query_system_information_buffer(SYSTEM_EXTENDED_HANDLE_INFORMATION)?;
     let table = get_handle_table(&buffer);
 
-    for (pid, handles) in table.into_iter().into_group_map_by(|elt| elt.unique_process_id()) {        
+    for (pid, handles) in table.iter().into_group_map_by(|elt| elt.unique_process_id()) {        
         if let Ok(open_process) = unsafe {
             OpenProcess(
                 PROCESS_ACCESS_RIGHTS_DUP_HANDLE | PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION, 
@@ -144,7 +144,7 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
                 }
             }
 
-            if process_info.locked_file.len() > 0 {
+            if !process_info.locked_file.is_empty() {
                 process_info.domain_username = get_handle_owner_info(open_process).unwrap();
                 let (name, path) = get_process_info(pid as u32).unwrap();
 
