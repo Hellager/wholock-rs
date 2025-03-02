@@ -1,5 +1,11 @@
 # Wholock-rs
 
+[![](https://img.shields.io/crates/v/wholock.svg)](https://crates.io/crates/wholock)
+[![][img_doc]][doc]
+![Crates.io Total Downloads](https://img.shields.io/crates/d/wholock)
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/Hellager/wholock-rs/publish.yml)
+![Crates.io License](https://img.shields.io/crates/l/wholock)
+
 Read this in other languages: [English](README.md) | [中文](README.cn.md)
 
 ## Overview
@@ -141,3 +147,6 @@ Distributed under the [LICENSE-MIT](LICENSE-MIT) License. See LICENSE for more i
 ## Author
 
 Developed with 🦀 by @Hellager
+
+[img_doc]: https://img.shields.io/badge/doc-latest-orange
+[doc]: https://docs.rs/wholock/latest/wholock/
