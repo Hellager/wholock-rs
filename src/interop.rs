@@ -314,6 +314,13 @@ fn lexical_absolute_path(path: &str) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().to_string())
 }
 
+pub(crate) fn target_path_is_missing(path: &str) -> bool {
+    match std::fs::metadata(path).or_else(|_| std::fs::metadata(lexical_absolute_path(path))) {
+        Ok(_) => false,
+        Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
 fn directory_match_prefix(path: &str) -> String {
     if path.ends_with('\\') {
         path.to_string()
@@ -609,6 +616,15 @@ mod tests {
             &sibling_final_path,
             dir.path().to_str().unwrap()
         ));
+    }
+
+    #[test]
+    fn test_target_path_is_missing() {
+        let dir = tempdir().unwrap();
+        let missing_path = dir.path().join("missing.txt");
+
+        assert!(target_path_is_missing(missing_path.to_str().unwrap()));
+        assert!(!target_path_is_missing(dir.path().to_str().unwrap()));
     }
 
     #[test]

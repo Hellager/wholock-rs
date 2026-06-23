@@ -76,7 +76,6 @@ fn test_unlock_nonexistent_process() {
 }
 
 #[test]
-#[should_panic]
 fn test_who_locks_nonexistent_file() {
     let result = who_locks_file(r"C:\nonexistent\file.txt");
     assert!(result.is_ok());

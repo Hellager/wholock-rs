@@ -4,8 +4,8 @@ mod interop;
 use crate::error::WholockError;
 use crate::interop::{
     duplicate_handle, get_final_path_name_by_handle, get_handle_owner_info, get_handle_table,
-    get_process_info, is_file_handle, query_system_information_buffer, LockedPathMatcher,
-    PROCESS_ACCESS_RIGHTS_DUP_HANDLE, PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
+    get_process_info, is_file_handle, query_system_information_buffer, target_path_is_missing,
+    LockedPathMatcher, PROCESS_ACCESS_RIGHTS_DUP_HANDLE, PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
     SYSTEM_EXTENDED_HANDLE_INFORMATION,
 };
 use itertools::Itertools;
@@ -84,6 +84,10 @@ impl Drop for HandleWrapper {
 /// }
 /// ```
 pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
+    if target_path_is_missing(path) {
+        return Ok(Vec::new());
+    }
+
     let current_process: windows::Win32::Foundation::HANDLE = unsafe { GetCurrentProcess() };
     let mut result: Vec<ProcessInfo> = vec![];
     let matcher = LockedPathMatcher::new(path);
@@ -95,11 +99,15 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
         .iter()
         .into_group_map_by(|elt| elt.unique_process_id())
     {
+        let Ok(pid) = u32::try_from(pid) else {
+            continue;
+        };
+
         if let Ok(open_process) = unsafe {
             OpenProcess(
                 PROCESS_ACCESS_RIGHTS_DUP_HANDLE | PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
                 false,
-                pid.try_into().unwrap(),
+                pid,
             )
         } {
             if open_process.is_invalid() {
@@ -107,7 +115,7 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
             }
 
             let mut process_info = ProcessInfo {
-                pid: pid.try_into().unwrap(),
+                pid,
                 process_name: "".to_string(),
                 process_exe_path: "".to_string(),
                 domain_username: "".to_string(),
@@ -116,11 +124,11 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
 
             for handle in handles.iter() {
                 let handle_entry = *handle;
-                let dup_handle = HandleWrapper::new(duplicate_handle(
-                    current_process,
-                    open_process,
-                    handle_entry,
-                )?);
+                let Ok(dup_handle) = duplicate_handle(current_process, open_process, handle_entry)
+                else {
+                    continue;
+                };
+                let dup_handle = HandleWrapper::new(dup_handle);
                 if dup_handle.is_invalid() {
                     continue;
                 }
@@ -137,11 +145,13 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
             }
 
             if !process_info.locked_file.is_empty() {
-                process_info.domain_username = get_handle_owner_info(open_process).unwrap();
-                let (name, path) = get_process_info(pid as u32).unwrap();
+                process_info.domain_username =
+                    get_handle_owner_info(open_process).unwrap_or_default();
 
-                process_info.process_name = name;
-                process_info.process_exe_path = path;
+                if let Ok((name, path)) = get_process_info(pid) {
+                    process_info.process_name = name;
+                    process_info.process_exe_path = path;
+                }
 
                 result.push(process_info);
             }
