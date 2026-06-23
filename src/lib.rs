@@ -10,6 +10,7 @@ use crate::interop::{
     PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION, SYSTEM_EXTENDED_HANDLE_INFORMATION,
 };
 use itertools::Itertools;
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
@@ -22,13 +23,48 @@ use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 pub type WholockResult<T> = Result<T, WholockError>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ProcessInfo {
     pub pid: u32,
     pub process_name: String,
     pub process_exe_path: String,
     pub domain_username: String,
     pub locked_file: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct JsonProcess<'a> {
+    pid: u32,
+    name: &'a str,
+    user: &'a str,
+    files: &'a [String],
+}
+
+#[derive(Serialize)]
+struct JsonProcessList<'a> {
+    processes: Vec<JsonProcess<'a>>,
+}
+
+fn json_process_list(processes: &[ProcessInfo]) -> JsonProcessList<'_> {
+    JsonProcessList {
+        processes: processes
+            .iter()
+            .map(|process| JsonProcess {
+                pid: process.pid,
+                name: &process.process_name,
+                user: &process.domain_username,
+                files: &process.locked_file,
+            })
+            .collect(),
+    }
+}
+
+/// Serializes process lock results as PowerToys-compatible JSON.
+///
+/// The output shape is `{ "processes": [{ "pid", "name", "user", "files" }] }`.
+pub fn processes_to_json(processes: &[ProcessInfo]) -> WholockResult<String> {
+    serde_json::to_string(&json_process_list(processes))
+        .map_err(|err| WholockError::Other(format!("Failed to serialize JSON output: {err}")))
 }
 
 struct HandleWrapper(HANDLE);
@@ -526,6 +562,26 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(find_processes_recursive(paths).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_processes_to_json() {
+        let processes = vec![ProcessInfo {
+            pid: 42,
+            process_name: "locker.exe".to_string(),
+            process_exe_path: r"C:\tools\locker.exe".to_string(),
+            domain_username: r"DOMAIN\user".to_string(),
+            locked_file: vec![r"C:\data\locked.txt".to_string()],
+        }];
+
+        let json = processes_to_json(&processes).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["processes"][0]["pid"], 42);
+        assert_eq!(value["processes"][0]["name"], "locker.exe");
+        assert_eq!(value["processes"][0]["user"], r"DOMAIN\user");
+        assert_eq!(value["processes"][0]["files"][0], r"C:\data\locked.txt");
+        assert!(value["processes"][0].get("process_name").is_none());
     }
 
     // This test is not ok for now
