@@ -38,11 +38,46 @@ pub struct UnlockProcessResult {
     pub pid: u32,
     pub process_name: String,
     pub result: WholockResult<()>,
+    pub failure: Option<ProcessTerminationFailure>,
 }
 
 impl UnlockProcessResult {
     pub fn is_success(&self) -> bool {
         self.result.is_ok()
+    }
+
+    pub fn failure_reason(&self) -> Option<&str> {
+        self.failure.as_ref().map(|failure| failure.reason.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessTerminationFailureKind {
+    InvalidPid,
+    OpenProcess,
+    TerminateProcess,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessTerminationFailure {
+    pub pid: u32,
+    pub kind: ProcessTerminationFailureKind,
+    pub reason: String,
+}
+
+impl ProcessTerminationFailure {
+    fn to_wholock_error(&self) -> WholockError {
+        match self.kind {
+            ProcessTerminationFailureKind::InvalidPid => WholockError::InvalidPID(self.pid),
+            ProcessTerminationFailureKind::OpenProcess => WholockError::ProcessError(format!(
+                "Failed to open process {} for termination: {}",
+                self.pid, self.reason
+            )),
+            ProcessTerminationFailureKind::TerminateProcess => WholockError::ProcessError(format!(
+                "Failed to terminate process {}: {}",
+                self.pid, self.reason
+            )),
+        }
     }
 }
 
@@ -547,26 +582,48 @@ fn sanitize_pid(pid: u32) -> WholockResult<()> {
     Ok(())
 }
 
-fn terminate_process_by_pid(pid: u32) -> WholockResult<()> {
+fn terminate_process_by_pid_detailed(pid: u32) -> Result<(), ProcessTerminationFailure> {
     use windows::Win32::System::Threading::PROCESS_TERMINATE;
 
-    sanitize_pid(pid)?;
+    if let Err(err) = sanitize_pid(pid) {
+        return Err(ProcessTerminationFailure {
+            pid,
+            kind: ProcessTerminationFailureKind::InvalidPid,
+            reason: err.to_string(),
+        });
+    }
 
     unsafe {
-        let process_handle = OpenProcess(PROCESS_TERMINATE, false, pid)?;
+        let process_handle = OpenProcess(PROCESS_TERMINATE, false, pid).map_err(|err| {
+            ProcessTerminationFailure {
+                pid,
+                kind: ProcessTerminationFailureKind::OpenProcess,
+                reason: err.to_string(),
+            }
+        })?;
         if process_handle.is_invalid() {
-            return Err(WholockError::HandleError(
-                "Failed to open process".to_string(),
-            ));
+            return Err(ProcessTerminationFailure {
+                pid,
+                kind: ProcessTerminationFailureKind::OpenProcess,
+                reason: "OpenProcess returned an invalid handle".to_string(),
+            });
         }
         let process_handle = HandleWrapper::new(process_handle);
 
         if let Err(e) = TerminateProcess(process_handle.get(), 1) {
-            return Err(e.into());
+            return Err(ProcessTerminationFailure {
+                pid,
+                kind: ProcessTerminationFailureKind::TerminateProcess,
+                reason: e.to_string(),
+            });
         }
 
         Ok(())
     }
+}
+
+fn terminate_process_by_pid(pid: u32) -> WholockResult<()> {
+    terminate_process_by_pid_detailed(pid).map_err(|failure| failure.to_wholock_error())
 }
 
 /// Terminates a process to unlock files held by that process
@@ -619,10 +676,19 @@ pub fn unlock_processes(processes: &[ProcessInfo]) -> Vec<UnlockProcessResult> {
     processes
         .iter()
         .filter(|process| seen.insert(process.pid))
-        .map(|process| UnlockProcessResult {
-            pid: process.pid,
-            process_name: process.process_name.clone(),
-            result: terminate_process_by_pid(process.pid),
+        .map(|process| {
+            let detailed_result = terminate_process_by_pid_detailed(process.pid);
+            let failure = detailed_result.err();
+            let result = failure
+                .as_ref()
+                .map_or(Ok(()), |failure| Err(failure.to_wholock_error()));
+
+            UnlockProcessResult {
+                pid: process.pid,
+                process_name: process.process_name.clone(),
+                result,
+                failure,
+            }
         })
         .collect()
 }
@@ -721,6 +787,13 @@ mod tests {
         assert_eq!(results[0].pid, u32::MAX);
         assert_eq!(results[0].process_name, "missing.exe");
         assert!(!results[0].is_success());
+        assert_eq!(
+            results[0].failure.as_ref().map(|failure| failure.kind),
+            Some(ProcessTerminationFailureKind::InvalidPid)
+        );
+        assert!(results[0]
+            .failure_reason()
+            .is_some_and(|reason| reason.contains("Invalid PID")));
         assert!(matches!(
             &results[0].result,
             Err(WholockError::InvalidPID(pid)) if *pid == u32::MAX

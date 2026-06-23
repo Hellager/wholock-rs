@@ -129,7 +129,16 @@ fn main() {
                             eprintln!("Successfully terminated process {}", unlock.pid)
                         }
                         Ok(_) => println!("Successfully terminated process {}", unlock.pid),
-                        Err(e) => eprintln!("Failed to terminate process {}: {}", unlock.pid, e),
+                        Err(e) => {
+                            if let Some(failure) = &unlock.failure {
+                                eprintln!(
+                                    "Failed to terminate process {} ({:?}): {}",
+                                    unlock.pid, failure.kind, failure.reason
+                                );
+                            } else {
+                                eprintln!("Failed to terminate process {}: {}", unlock.pid, e);
+                            }
+                        }
                     }
                 }
             }
