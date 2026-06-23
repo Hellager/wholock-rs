@@ -38,12 +38,14 @@ pub(crate) const PROCESS_ACCESS_RIGHTS_DUP_HANDLE: PROCESS_ACCESS_RIGHTS =
 pub(crate) const PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION: PROCESS_ACCESS_RIGHTS =
     PROCESS_ACCESS_RIGHTS(0x0400);
 
+#[repr(C)]
 pub(crate) struct SystemHandleInformationEx {
     number_of_handles: usize,
     _reserved: usize,
     handles: [SystemHandleTableEntryInfoEx; 1],
 }
 
+#[repr(C)]
 pub(crate) struct SystemHandleTableEntryInfoEx {
     #[allow(dead_code)]
     object: *mut c_void,
@@ -60,6 +62,7 @@ pub(crate) struct SystemHandleTableEntryInfoEx {
     _reserved: c_ulong,
 }
 
+#[repr(transparent)]
 pub(crate) struct HandleEntry(SystemHandleTableEntryInfoEx);
 
 impl HandleEntry {
@@ -518,6 +521,7 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::os::windows::io::AsRawHandle;
+    use std::ptr::addr_of;
     use tempfile::tempdir;
     use windows::Win32::System::Threading::GetCurrentProcess;
 
@@ -534,6 +538,47 @@ mod tests {
         let buffer = query_system_information_buffer(SYSTEM_EXTENDED_HANDLE_INFORMATION).unwrap();
         let table = get_handle_table(&buffer);
         assert!(!table.is_empty());
+    }
+
+    #[test]
+    fn test_system_handle_struct_layout() {
+        let info = SystemHandleInformationEx {
+            number_of_handles: 0,
+            _reserved: 0,
+            handles: [SystemHandleTableEntryInfoEx {
+                object: std::ptr::null_mut(),
+                unique_process_id: 0,
+                handle_value: std::ptr::null_mut(),
+                granted_access: 0,
+                creator_back_trace_index: 0,
+                object_type_index: 0,
+                handle_attributes: 0,
+                _reserved: 0,
+            }],
+        };
+        let info_base = addr_of!(info).cast::<u8>() as usize;
+        let handles_offset = addr_of!(info.handles).cast::<u8>() as usize - info_base;
+
+        assert_eq!(
+            handles_offset,
+            2 * mem::size_of::<usize>(),
+            "SYSTEM_HANDLE_INFORMATION_EX handles offset must match NT ABI"
+        );
+        assert_eq!(
+            mem::size_of::<SystemHandleTableEntryInfoEx>(),
+            3 * mem::size_of::<usize>() + 4 * mem::size_of::<c_ulong>(),
+            "SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX size must match NT ABI"
+        );
+        assert_eq!(
+            mem::size_of::<HandleEntry>(),
+            mem::size_of::<SystemHandleTableEntryInfoEx>(),
+            "HandleEntry must remain a transparent wrapper"
+        );
+        assert_eq!(
+            mem::align_of::<HandleEntry>(),
+            mem::align_of::<SystemHandleTableEntryInfoEx>(),
+            "HandleEntry alignment must match the underlying NT entry"
+        );
     }
 
     #[test]
