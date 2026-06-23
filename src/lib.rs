@@ -6,9 +6,8 @@ use crate::interop::{
     duplicate_handle, enable_debug_privilege as enable_current_process_debug_privilege,
     get_final_path_name_by_handle, get_handle_owner_info, get_handle_table, get_process_info,
     get_process_module_paths, is_file_handle, is_process_elevated as current_process_is_elevated,
-    query_system_information_buffer, target_path_is_missing, LockedPathMatcher,
-    PROCESS_ACCESS_RIGHTS_DUP_HANDLE, PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
-    SYSTEM_EXTENDED_HANDLE_INFORMATION,
+    query_system_information_buffer, LockedPathMatchers, PROCESS_ACCESS_RIGHTS_DUP_HANDLE,
+    PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION, SYSTEM_EXTENDED_HANDLE_INFORMATION,
 };
 use itertools::Itertools;
 use std::collections::{BTreeMap, BTreeSet};
@@ -191,10 +190,9 @@ impl ProcessLockCollector {
     }
 }
 
-/// Identifies all processes that have locked a specified file
+/// Identifies all processes that have locked a specified file.
 ///
-/// This function works by enumerating all handles in the system and identifying
-/// processes that currently have locks on the specified file path.
+/// This is a compatibility wrapper around [`find_processes_recursive`].
 ///
 /// # Arguments
 ///
@@ -226,7 +224,34 @@ impl ProcessLockCollector {
 /// }
 /// ```
 pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
-    if target_path_is_missing(path) {
+    find_processes_recursive(std::iter::once(path))
+}
+
+/// Identifies all processes that have locked any of the specified files or directories.
+///
+/// Directory inputs are matched recursively, so files and loaded modules underneath a
+/// requested directory are included in the result. Missing paths are ignored, matching
+/// the behavior of the single-path API.
+pub fn who_locks_files<I, P>(paths: I) -> WholockResult<Vec<ProcessInfo>>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<str>,
+{
+    find_processes_recursive(paths)
+}
+
+/// Identifies all processes that have locked any of the specified files or directories.
+///
+/// This mirrors PowerToys File Locksmith's recursive multi-path query shape.
+/// Directory inputs are matched recursively, and all paths are checked during one
+/// system handle/module scan.
+pub fn find_processes_recursive<I, P>(paths: I) -> WholockResult<Vec<ProcessInfo>>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<str>,
+{
+    let matchers = LockedPathMatchers::new(paths);
+    if matchers.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -234,7 +259,6 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
 
     let current_process: windows::Win32::Foundation::HANDLE = unsafe { GetCurrentProcess() };
     let mut result: BTreeMap<u32, ProcessLockCollector> = BTreeMap::new();
-    let matcher = LockedPathMatcher::new(path);
 
     let buffer = query_system_information_buffer(SYSTEM_EXTENDED_HANDLE_INFORMATION)?;
     let table = get_handle_table(&buffer);
@@ -278,7 +302,7 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
                 }
 
                 if let Ok(full_name) = get_final_path_name_by_handle(&dup_handle.get()) {
-                    if matcher.matches(&full_name) {
+                    if matchers.matches(&full_name) {
                         process_info.insert_path(full_name);
                     }
                 }
@@ -299,7 +323,7 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
     {
         if let Ok(module_paths) = get_process_module_paths(pid) {
             for module_path in module_paths {
-                if matcher.matches(&module_path) {
+                if matchers.matches(&module_path) {
                     result
                         .entry(pid)
                         .or_insert_with(|| ProcessLockCollector::new(pid, None))
@@ -412,6 +436,21 @@ mod tests {
             quote_windows_arg_from_str(r#"C:\path with space\"#),
             r#""C:\path with space\\""#
         );
+    }
+
+    #[test]
+    fn test_find_processes_recursive_missing_paths() {
+        let dir = tempdir().unwrap();
+        let paths = [
+            dir.path().join("missing-a.txt"),
+            dir.path().join("missing-b.txt"),
+        ];
+        let paths = paths
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(find_processes_recursive(paths).unwrap().is_empty());
     }
 
     // This test is not ok for now

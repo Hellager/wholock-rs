@@ -354,19 +354,65 @@ impl LockedPathMatcher {
         }
     }
 
-    pub(crate) fn matches(&self, path: &str) -> bool {
-        let path = normalize_path(path);
+    fn matches_normalized(&self, path: &str) -> bool {
         path == self.target_path
             || self
                 .target_directory_prefix
                 .as_ref()
                 .is_some_and(|prefix| path.starts_with(prefix))
     }
+
+    #[cfg(test)]
+    pub(crate) fn matches(&self, path: &str) -> bool {
+        self.matches_normalized(&normalize_path(path))
+    }
+}
+
+pub(crate) struct LockedPathMatchers {
+    matchers: Vec<LockedPathMatcher>,
+}
+
+impl LockedPathMatchers {
+    pub(crate) fn new<I, P>(paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<str>,
+    {
+        let matchers = paths
+            .into_iter()
+            .filter_map(|path| {
+                let path = path.as_ref();
+                (!target_path_is_missing(path)).then(|| LockedPathMatcher::new(path))
+            })
+            .collect();
+
+        Self { matchers }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.matchers.is_empty()
+    }
+
+    pub(crate) fn matches(&self, path: &str) -> bool {
+        let path = normalize_path(path);
+        self.matchers
+            .iter()
+            .any(|matcher| matcher.matches_normalized(&path))
+    }
 }
 
 #[cfg(test)]
 pub(crate) fn check_if_locked_file(path: &str, target_path: &str) -> bool {
     LockedPathMatcher::new(target_path).matches(path)
+}
+
+#[cfg(test)]
+pub(crate) fn check_if_locked_files<I, P>(path: &str, target_paths: I) -> bool
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<str>,
+{
+    LockedPathMatchers::new(target_paths).matches(path)
 }
 
 pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
@@ -746,6 +792,28 @@ mod tests {
             &sibling_final_path,
             dir.path().to_str().unwrap()
         ));
+    }
+
+    #[test]
+    fn test_check_if_locked_files() {
+        let dir = tempdir().unwrap();
+        let nested_file_path = dir.path().join("nested").join("locked.txt");
+        std::fs::create_dir_all(nested_file_path.parent().unwrap()).unwrap();
+        File::create(&nested_file_path).unwrap();
+
+        let sibling_dir = tempdir().unwrap();
+        let sibling_file_path = sibling_dir.path().join("locked.txt");
+        File::create(&sibling_file_path).unwrap();
+
+        let nested_final_path = final_path_for_path(nested_file_path.to_str().unwrap()).unwrap();
+        let sibling_final_path = final_path_for_path(sibling_file_path.to_str().unwrap()).unwrap();
+        let targets = [
+            sibling_file_path.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+        ];
+
+        assert!(check_if_locked_files(&nested_final_path, targets));
+        assert!(check_if_locked_files(&sibling_final_path, targets));
     }
 
     #[test]
