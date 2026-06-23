@@ -1,5 +1,5 @@
 use std::env;
-use wholock::{processes_to_json, unlock_file, who_locks_file};
+use wholock::{processes_to_json, unlock_processes, who_locks_file};
 
 fn main() {
     env_logger::init();
@@ -55,10 +55,10 @@ fn main() {
             }
 
             if should_unlock {
-                for process in &processes {
+                for unlock in unlock_processes(&processes) {
                     let status = format!(
                         "Attempting to unlock by terminating process {}...",
-                        process.pid
+                        unlock.pid
                     );
                     if json_output {
                         eprintln!("{status}");
@@ -66,12 +66,12 @@ fn main() {
                         println!("{status}");
                     }
 
-                    match unlock_file(process.pid) {
+                    match unlock.result {
                         Ok(_) if json_output => {
-                            eprintln!("Successfully terminated process {}", process.pid)
+                            eprintln!("Successfully terminated process {}", unlock.pid)
                         }
-                        Ok(_) => println!("Successfully terminated process {}", process.pid),
-                        Err(e) => eprintln!("Failed to terminate process {}: {}", process.pid, e),
+                        Ok(_) => println!("Successfully terminated process {}", unlock.pid),
+                        Err(e) => eprintln!("Failed to terminate process {}: {}", unlock.pid, e),
                     }
                 }
             }

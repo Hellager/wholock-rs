@@ -32,6 +32,19 @@ pub struct ProcessInfo {
     pub locked_file: Vec<String>,
 }
 
+#[derive(Debug)]
+pub struct UnlockProcessResult {
+    pub pid: u32,
+    pub process_name: String,
+    pub result: WholockResult<()>,
+}
+
+impl UnlockProcessResult {
+    pub fn is_success(&self) -> bool {
+        self.result.is_ok()
+    }
+}
+
 #[derive(Serialize)]
 struct JsonProcess<'a> {
     pid: u32,
@@ -461,6 +474,28 @@ fn sanitize_pid(pid: u32) -> WholockResult<()> {
     Ok(())
 }
 
+fn terminate_process_by_pid(pid: u32) -> WholockResult<()> {
+    use windows::Win32::System::Threading::PROCESS_TERMINATE;
+
+    sanitize_pid(pid)?;
+
+    unsafe {
+        let process_handle = OpenProcess(PROCESS_TERMINATE, false, pid)?;
+        if process_handle.is_invalid() {
+            return Err(WholockError::HandleError(
+                "Failed to open process".to_string(),
+            ));
+        }
+        let process_handle = HandleWrapper::new(process_handle);
+
+        if let Err(e) = TerminateProcess(process_handle.get(), 1) {
+            return Err(e.into());
+        }
+
+        Ok(())
+    }
+}
+
 /// Terminates a process to unlock files held by that process
 ///
 /// This function forcibly terminates the specified process, which will release
@@ -499,25 +534,24 @@ fn sanitize_pid(pid: u32) -> WholockResult<()> {
 /// }
 /// ```
 pub fn unlock_file(pid: u32) -> WholockResult<()> {
-    use windows::Win32::System::Threading::PROCESS_TERMINATE;
+    terminate_process_by_pid(pid)
+}
 
-    sanitize_pid(pid)?;
-
-    unsafe {
-        let process_handle = OpenProcess(PROCESS_TERMINATE, false, pid)?;
-        if process_handle.is_invalid() {
-            return Err(WholockError::HandleError(
-                "Failed to open process".to_string(),
-            ));
-        }
-        let process_handle = HandleWrapper::new(process_handle);
-
-        if let Err(e) = TerminateProcess(process_handle.get(), 1) {
-            return Err(e.into());
-        }
-
-        Ok(())
-    }
+/// Terminates all processes in a lock query result.
+///
+/// Each process is attempted independently and the returned vector contains one
+/// result per unique PID.
+pub fn unlock_processes(processes: &[ProcessInfo]) -> Vec<UnlockProcessResult> {
+    let mut seen = BTreeSet::new();
+    processes
+        .iter()
+        .filter(|process| seen.insert(process.pid))
+        .map(|process| UnlockProcessResult {
+            pid: process.pid,
+            process_name: process.process_name.clone(),
+            result: terminate_process_by_pid(process.pid),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -582,6 +616,42 @@ mod tests {
         assert_eq!(value["processes"][0]["user"], r"DOMAIN\user");
         assert_eq!(value["processes"][0]["files"][0], r"C:\data\locked.txt");
         assert!(value["processes"][0].get("process_name").is_none());
+    }
+
+    #[test]
+    fn test_unlock_processes_empty() {
+        assert!(unlock_processes(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_unlock_processes_reports_invalid_pid_once() {
+        let processes = vec![
+            ProcessInfo {
+                pid: u32::MAX,
+                process_name: "missing.exe".to_string(),
+                process_exe_path: String::new(),
+                domain_username: String::new(),
+                locked_file: Vec::new(),
+            },
+            ProcessInfo {
+                pid: u32::MAX,
+                process_name: "missing-again.exe".to_string(),
+                process_exe_path: String::new(),
+                domain_username: String::new(),
+                locked_file: Vec::new(),
+            },
+        ];
+
+        let results = unlock_processes(&processes);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].pid, u32::MAX);
+        assert_eq!(results[0].process_name, "missing.exe");
+        assert!(!results[0].is_success());
+        assert!(matches!(
+            &results[0].result,
+            Err(WholockError::InvalidPID(pid)) if *pid == u32::MAX
+        ));
     }
 
     // This test is not ok for now
