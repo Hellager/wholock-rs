@@ -19,6 +19,7 @@ use windows::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetLastError, SetLastError, DUPLICATE_HANDLE_OPTIONS,
     ERROR_NOT_ALL_ASSIGNED, HANDLE, MAX_PATH, UNICODE_STRING, WIN32_ERROR,
 };
+use windows::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
 use windows::Win32::Security::{
     AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, TokenElevation, TokenUser,
     LUID_AND_ATTRIBUTES, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES,
@@ -341,7 +342,24 @@ fn normalize_path(path: &str) -> String {
         path.pop();
     }
 
-    path.to_lowercase()
+    path
+}
+
+fn windows_ignore_case_eq(left: &str, right: &str) -> bool {
+    let left = left.encode_utf16().collect::<Vec<_>>();
+    let right = right.encode_utf16().collect::<Vec<_>>();
+    windows_ignore_case_eq_wide(&left, &right)
+}
+
+fn windows_ignore_case_eq_wide(left: &[u16], right: &[u16]) -> bool {
+    unsafe { CompareStringOrdinal(left, right, true) == CSTR_EQUAL }
+}
+
+fn windows_path_starts_with_ignore_case(path: &str, prefix: &str) -> bool {
+    let path = path.encode_utf16().collect::<Vec<_>>();
+    let prefix = prefix.encode_utf16().collect::<Vec<_>>();
+
+    path.len() >= prefix.len() && windows_ignore_case_eq_wide(&path[..prefix.len()], &prefix)
 }
 
 fn wide_null(path: &str) -> Vec<u16> {
@@ -415,11 +433,11 @@ impl LockedPathMatcher {
     }
 
     fn matches_normalized(&self, path: &str) -> bool {
-        path == self.target_path
+        windows_ignore_case_eq(path, &self.target_path)
             || self
                 .target_directory_prefix
                 .as_ref()
-                .is_some_and(|prefix| path.starts_with(prefix))
+                .is_some_and(|prefix| windows_path_starts_with_ignore_case(path, prefix))
     }
 
     #[cfg(test)]
@@ -845,6 +863,10 @@ mod tests {
             file_path.to_str().unwrap()
         ));
         assert!(check_if_locked_file(
+            &file_final_path.replace("locked.txt", "LOCKED.TXT"),
+            file_path.to_str().unwrap()
+        ));
+        assert!(check_if_locked_file(
             &file_final_path,
             dir.path().to_str().unwrap()
         ));
@@ -873,6 +895,10 @@ mod tests {
         ];
 
         assert!(check_if_locked_files(&nested_final_path, targets));
+        assert!(check_if_locked_files(
+            &nested_final_path.to_uppercase(),
+            targets
+        ));
         assert!(check_if_locked_files(&sibling_final_path, targets));
     }
 
