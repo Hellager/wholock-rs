@@ -1,5 +1,6 @@
 use std::env;
-use wholock::{processes_to_json, unlock_processes, who_locks_file};
+use std::time::Duration;
+use wholock::{processes_to_json, unlock_processes, wait_for_unlock, who_locks_file};
 
 fn main() {
     env_logger::init();
@@ -9,24 +10,81 @@ fn main() {
     let mut file_path = None;
     let mut should_unlock = false;
     let mut json_output = false;
+    let mut wait = false;
+    let mut wait_timeout = None;
+    let mut args = args.peekable();
 
-    for arg in args {
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--unlock" => should_unlock = true,
             "--json" => json_output = true,
+            "--wait" => {
+                wait = true;
+                if let Some(next) = args.peek() {
+                    if !next.starts_with("--") {
+                        let timeout = args.next().unwrap();
+                        match timeout.parse::<u64>() {
+                            Ok(seconds) => wait_timeout = Some(Duration::from_secs(seconds)),
+                            Err(_) => {
+                                eprintln!("Invalid --wait timeout: {timeout}");
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            "--timeout" => {
+                let Some(timeout) = args.next() else {
+                    eprintln!("Missing value for --timeout");
+                    return;
+                };
+                match timeout.parse::<u64>() {
+                    Ok(seconds) => wait_timeout = Some(Duration::from_secs(seconds)),
+                    Err(_) => {
+                        eprintln!("Invalid --timeout value: {timeout}");
+                        return;
+                    }
+                }
+            }
             _ if file_path.is_none() => file_path = Some(arg),
             _ => {
                 eprintln!("Unexpected argument: {arg}");
-                eprintln!("Usage: {program} <file_path> [--unlock] [--json]");
+                eprintln!("Usage: {program} <file_path> [--unlock] [--json] [--wait [seconds]]");
                 return;
             }
         }
     }
 
     let Some(file_path) = file_path else {
-        println!("Usage: {program} <file_path> [--unlock] [--json]");
+        println!("Usage: {program} <file_path> [--unlock] [--json] [--wait [seconds]]");
         return;
     };
+
+    if wait {
+        if json_output {
+            eprintln!("Warning: --wait is incompatible with --json; ignoring --json");
+        }
+
+        println!("Waiting for files to be unlocked...");
+        match wait_for_unlock(&file_path, wait_timeout) {
+            Ok(result) if result.unlocked => {
+                println!("Files unlocked after {:.2}s", result.elapsed.as_secs_f64());
+            }
+            Ok(result) => {
+                eprintln!(
+                    "Timed out after {:.2}s; {} process(es) still locking the file",
+                    result.elapsed.as_secs_f64(),
+                    result.remaining_locks.len()
+                );
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     match who_locks_file(&file_path) {
         Ok(processes) => {

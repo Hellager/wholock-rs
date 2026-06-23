@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, WIN32_ERROR};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, TerminateProcess};
@@ -42,6 +43,19 @@ pub struct UnlockProcessResult {
 impl UnlockProcessResult {
     pub fn is_success(&self) -> bool {
         self.result.is_ok()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WaitForUnlockResult {
+    pub unlocked: bool,
+    pub elapsed: Duration,
+    pub remaining_locks: Vec<ProcessInfo>,
+}
+
+impl WaitForUnlockResult {
+    pub fn timed_out(&self) -> bool {
+        !self.unlocked
     }
 }
 
@@ -463,6 +477,65 @@ where
         .collect())
 }
 
+const WAIT_FOR_UNLOCK_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Waits until a single file or directory no longer has matching locks.
+pub fn wait_for_unlock(
+    path: &str,
+    timeout: Option<Duration>,
+) -> WholockResult<WaitForUnlockResult> {
+    wait_for_unlock_files(std::iter::once(path), timeout)
+}
+
+/// Waits until all files or directories no longer have matching locks.
+///
+/// The query is retried every 200ms. If `timeout` is `None`, this waits
+/// indefinitely.
+pub fn wait_for_unlock_files<I, P>(
+    paths: I,
+    timeout: Option<Duration>,
+) -> WholockResult<WaitForUnlockResult>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<str>,
+{
+    let paths = paths
+        .into_iter()
+        .map(|path| path.as_ref().to_string())
+        .collect::<Vec<_>>();
+    let start = Instant::now();
+
+    loop {
+        let remaining_locks = find_processes_recursive(paths.iter().map(String::as_str))?;
+        let elapsed = start.elapsed();
+
+        if remaining_locks.is_empty() {
+            return Ok(WaitForUnlockResult {
+                unlocked: true,
+                elapsed,
+                remaining_locks,
+            });
+        }
+
+        if timeout.is_some_and(|timeout| elapsed > timeout) {
+            return Ok(WaitForUnlockResult {
+                unlocked: false,
+                elapsed,
+                remaining_locks,
+            });
+        }
+
+        let sleep_for = timeout
+            .map(|timeout| {
+                timeout
+                    .saturating_sub(elapsed)
+                    .min(WAIT_FOR_UNLOCK_POLL_INTERVAL)
+            })
+            .unwrap_or(WAIT_FOR_UNLOCK_POLL_INTERVAL);
+        std::thread::sleep(sleep_for);
+    }
+}
+
 fn sanitize_pid(pid: u32) -> WholockResult<()> {
     let system = sysinfo::System::new_all();
     if !system
@@ -652,6 +725,19 @@ mod tests {
             &results[0].result,
             Err(WholockError::InvalidPID(pid)) if *pid == u32::MAX
         ));
+    }
+
+    #[test]
+    fn test_wait_for_unlock_missing_path_returns_unlocked() {
+        let dir = tempdir().unwrap();
+        let missing_path = dir.path().join("missing.txt");
+
+        let result =
+            wait_for_unlock(missing_path.to_str().unwrap(), Some(Duration::from_secs(1))).unwrap();
+
+        assert!(result.unlocked);
+        assert!(!result.timed_out());
+        assert!(result.remaining_locks.is_empty());
     }
 
     // This test is not ok for now
