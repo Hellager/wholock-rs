@@ -364,6 +364,17 @@ fn windows_path_starts_with_ignore_case(path: &str, prefix: &str) -> bool {
     path.len() >= prefix.len() && windows_ignore_case_eq_wide(&path[..prefix.len()], &prefix)
 }
 
+fn handle_lookup_account_sid_failure(error: WIN32_ERROR) -> WholockResult<String> {
+    if error == ERROR_NONE_MAPPED {
+        return Ok(String::new());
+    }
+
+    Err(WholockError::ProcessError(format!(
+        "LookupAccountSidW failed: {}",
+        get_win32_error_message(&error)
+    )))
+}
+
 fn wide_null(path: &str) -> Vec<u16> {
     path.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -549,8 +560,8 @@ pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
         );
         if lookup_probe.is_err() {
             let last_error = GetLastError();
-            if last_error == ERROR_NONE_MAPPED || name_size == 0 || domain_size == 0 {
-                return Ok(String::new());
+            if last_error == ERROR_NONE_MAPPED {
+                return handle_lookup_account_sid_failure(last_error);
             }
         }
 
@@ -572,7 +583,7 @@ pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
         )
         .is_err()
         {
-            return Ok(String::new());
+            return handle_lookup_account_sid_failure(GetLastError());
         }
 
         let name = String::from_utf16_lossy(&name[..name_size as usize]);
@@ -953,6 +964,17 @@ mod tests {
         let owner_info = get_handle_owner_info(HANDLE::default()).unwrap();
 
         assert!(owner_info.is_empty());
+    }
+
+    #[test]
+    fn test_lookup_account_sid_failure_mapping() {
+        assert!(handle_lookup_account_sid_failure(ERROR_NONE_MAPPED)
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            handle_lookup_account_sid_failure(WIN32_ERROR(5)),
+            Err(WholockError::ProcessError(message)) if message.contains("LookupAccountSidW failed")
+        ));
     }
 
     #[test]
