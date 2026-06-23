@@ -373,13 +373,20 @@ pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
         if result.is_err() {
             return Err(std::io::Error::last_os_error().into());
         }
+        let token_handle = SafeHandle::new(token_handle)?;
 
         let mut token_info_len = 0;
-        let _ = GetTokenInformation(token_handle, TokenUser, None, 0, &mut token_info_len);
+        let _ = GetTokenInformation(
+            token_handle.as_raw(),
+            TokenUser,
+            None,
+            0,
+            &mut token_info_len,
+        );
 
         let mut token_info = vec![0u8; token_info_len as usize];
         if GetTokenInformation(
-            token_handle,
+            token_handle.as_raw(),
             TokenUser,
             Some(token_info.as_mut_ptr() as *mut _),
             token_info_len,

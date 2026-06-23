@@ -110,6 +110,7 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
                 pid,
             )
         } {
+            let open_process = HandleWrapper::new(open_process);
             if open_process.is_invalid() {
                 continue;
             }
@@ -124,7 +125,8 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
 
             for handle in handles.iter() {
                 let handle_entry = *handle;
-                let Ok(dup_handle) = duplicate_handle(current_process, open_process, handle_entry)
+                let Ok(dup_handle) =
+                    duplicate_handle(current_process, open_process.get(), handle_entry)
                 else {
                     continue;
                 };
@@ -146,7 +148,7 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
 
             if !process_info.locked_file.is_empty() {
                 process_info.domain_username =
-                    get_handle_owner_info(open_process).unwrap_or_default();
+                    get_handle_owner_info(open_process.get()).unwrap_or_default();
 
                 if let Ok((name, path)) = get_process_info(pid) {
                     process_info.process_name = name;
@@ -221,13 +223,12 @@ pub fn unlock_file(pid: u32) -> WholockResult<()> {
                 "Failed to open process".to_string(),
             ));
         }
+        let process_handle = HandleWrapper::new(process_handle);
 
-        if let Err(e) = TerminateProcess(process_handle, 1) {
-            let _ = CloseHandle(process_handle);
+        if let Err(e) = TerminateProcess(process_handle.get(), 1) {
             return Err(e.into());
         }
 
-        let _ = CloseHandle(process_handle);
         Ok(())
     }
 }
