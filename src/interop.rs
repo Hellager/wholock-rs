@@ -17,7 +17,8 @@ use windows::Wdk::Foundation::{NtQueryObject, ObjectTypeInformation};
 use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS};
 use windows::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetLastError, SetLastError, DUPLICATE_HANDLE_OPTIONS,
-    ERROR_NONE_MAPPED, ERROR_NOT_ALL_ASSIGNED, HANDLE, MAX_PATH, UNICODE_STRING, WIN32_ERROR,
+    ERROR_NONE_MAPPED, ERROR_NOT_ALL_ASSIGNED, HANDLE, HMODULE, MAX_PATH, UNICODE_STRING,
+    WIN32_ERROR,
 };
 use windows::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
 use windows::Win32::Security::{
@@ -44,6 +45,7 @@ pub(crate) const PROCESS_ACCESS_RIGHTS_DUP_HANDLE: PROCESS_ACCESS_RIGHTS =
 pub(crate) const PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION: PROCESS_ACCESS_RIGHTS =
     PROCESS_ACCESS_RIGHTS(0x0400);
 const DUPLICATE_HANDLE_TIMEOUT: Duration = Duration::from_secs(1);
+const INITIAL_MODULE_CAPACITY: usize = 256;
 
 #[repr(C)]
 pub(crate) struct SystemHandleInformationEx {
@@ -738,6 +740,11 @@ pub(crate) fn get_process_info(pid: u32) -> WholockResult<(String, String)> {
     }
 }
 
+fn module_count_from_needed_bytes(needed: u32) -> usize {
+    let module_size = mem::size_of::<HMODULE>();
+    (needed as usize + module_size - 1) / module_size
+}
+
 pub(crate) fn get_process_module_paths(pid: u32) -> WholockResult<Vec<String>> {
     unsafe {
         let handle =
@@ -750,26 +757,31 @@ pub(crate) fn get_process_module_paths(pid: u32) -> WholockResult<Vec<String>> {
             })?;
         let safe_handle = SafeHandle::new(handle)?;
 
-        let mut modules = vec![windows::Win32::Foundation::HMODULE::default(); 256];
+        let mut modules = vec![HMODULE::default(); INITIAL_MODULE_CAPACITY];
 
         loop {
             let mut needed = 0u32;
+            let buffer_bytes = modules.len() * mem::size_of::<HMODULE>();
+            let buffer_bytes = u32::try_from(buffer_bytes)
+                .map_err(|_| WholockError::Other("Module buffer is too large".to_string()))?;
             EnumProcessModules(
                 safe_handle.as_raw(),
                 modules.as_mut_ptr(),
-                (modules.len() * mem::size_of::<windows::Win32::Foundation::HMODULE>()) as u32,
+                buffer_bytes,
                 &mut needed,
             )
             .map_err(|e| WholockError::Win32Error(WIN32_ERROR(e.code().0 as u32)))?;
 
-            let needed_count =
-                needed as usize / mem::size_of::<windows::Win32::Foundation::HMODULE>();
-            if needed_count <= modules.len() {
-                modules.truncate(needed_count);
-                break;
+            let needed_count = module_count_from_needed_bytes(needed);
+            if needed > buffer_bytes {
+                modules.resize(needed_count, HMODULE::default());
+                continue;
             }
 
-            modules.resize(needed_count, windows::Win32::Foundation::HMODULE::default());
+            if needed_count <= modules.len() {
+                modules.truncate(needed as usize / mem::size_of::<HMODULE>());
+                break;
+            }
         }
 
         let mut paths = Vec::new();
@@ -1067,6 +1079,15 @@ mod tests {
         let invalid_path = "";
         let result = extract_filename(invalid_path);
         assert!(matches!(result, Err(WholockError::PathError(_))));
+    }
+
+    #[test]
+    fn test_module_count_from_needed_bytes() {
+        let module_size = mem::size_of::<HMODULE>() as u32;
+
+        assert_eq!(module_count_from_needed_bytes(0), 0);
+        assert_eq!(module_count_from_needed_bytes(module_size * 3), 3);
+        assert_eq!(module_count_from_needed_bytes(module_size * 3 + 1), 4);
     }
 
     #[test_log::test]
