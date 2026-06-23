@@ -11,11 +11,17 @@ use std::{
     slice,
 };
 use windows::core::{PCWSTR, PWSTR};
+use windows::Wdk::Foundation::{NtQueryObject, ObjectTypeInformation};
+use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS};
 use windows::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_HANDLE_OPTIONS, HANDLE, MAX_PATH,
-    UNICODE_STRING,
+    CloseHandle, DuplicateHandle, GetLastError, SetLastError, DUPLICATE_HANDLE_OPTIONS,
+    ERROR_NOT_ALL_ASSIGNED, HANDLE, MAX_PATH, UNICODE_STRING, WIN32_ERROR,
 };
-use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+use windows::Win32::Security::{
+    AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, TokenElevation, TokenUser,
+    LUID_AND_ATTRIBUTES, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_ELEVATION, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
+};
 use windows::Win32::Security::{LookupAccountSidW, SID_NAME_USE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFinalPathNameByHandleW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
@@ -23,13 +29,9 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::ProcessStatus::{EnumProcessModules, GetModuleFileNameExW};
 use windows::Win32::System::Threading::{
-    OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_ACCESS_RIGHTS,
-    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
-};
-use windows::{
-    Wdk::Foundation::{NtQueryObject, ObjectTypeInformation},
-    Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS},
-    Win32::Foundation::WIN32_ERROR,
+    GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_VM_READ,
 };
 
 pub(crate) const SYSTEM_EXTENDED_HANDLE_INFORMATION: SYSTEM_INFORMATION_CLASS =
@@ -436,6 +438,73 @@ pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
         let domain = String::from_utf16_lossy(&domain[..domain_size as usize]);
 
         Ok(format!("{}\\{}", domain, name))
+    }
+}
+
+pub(crate) fn is_process_elevated() -> WholockResult<bool> {
+    unsafe {
+        let mut token_handle = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle)
+            .map_err(WholockError::from)?;
+        let token_handle = SafeHandle::new(token_handle)?;
+
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut returned_len = 0u32;
+        GetTokenInformation(
+            token_handle.as_raw(),
+            TokenElevation,
+            Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
+            mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned_len,
+        )
+        .map_err(WholockError::from)?;
+
+        Ok(elevation.TokenIsElevated != 0)
+    }
+}
+
+pub(crate) fn enable_debug_privilege() -> WholockResult<()> {
+    unsafe {
+        let mut token_handle = HANDLE::default();
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token_handle,
+        )
+        .map_err(WholockError::from)?;
+        let token_handle = SafeHandle::new(token_handle)?;
+
+        let mut luid = Default::default();
+        LookupPrivilegeValueW(PCWSTR::null(), SE_DEBUG_NAME, &mut luid)
+            .map_err(WholockError::from)?;
+
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+
+        SetLastError(WIN32_ERROR(0));
+        AdjustTokenPrivileges(
+            token_handle.as_raw(),
+            false,
+            Some(&privileges),
+            mem::size_of::<TOKEN_PRIVILEGES>() as u32,
+            None,
+            None,
+        )
+        .map_err(WholockError::from)?;
+
+        let last_error = GetLastError();
+        if last_error == ERROR_NOT_ALL_ASSIGNED {
+            return Err(WholockError::PermissionError(
+                "SeDebugPrivilege is not assigned to the current process token".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 }
 
