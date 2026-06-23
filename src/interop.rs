@@ -11,9 +11,8 @@ use std::{
     slice,
 };
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, DUPLICATE_HANDLE_OPTIONS, MAX_PATH,
+    CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_HANDLE_OPTIONS, HANDLE, MAX_PATH,
 };
 use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
 use windows::Win32::Security::{LookupAccountSidW, SID_NAME_USE};
@@ -185,29 +184,26 @@ pub(crate) fn duplicate_handle(
 
 pub(crate) fn get_final_path_name_by_handle(h_file: &HANDLE) -> WholockResult<String> {
     let mut buf = vec![0u16; 1024];
-    let mut result =
-        unsafe { GetFinalPathNameByHandleW(*h_file, &mut buf, GETFINALPATHNAMEBYHANDLE_FLAGS(0)) };
 
-    if result == 0 {
-        return Err(WholockError::Win32Error(WIN32_ERROR(0x00000008)));
-    }
-
-    if result as usize >= buf.len() {
-        buf.resize(result as usize + 1, 0);
-        result = unsafe {
+    loop {
+        let result = unsafe {
             GetFinalPathNameByHandleW(*h_file, &mut buf, GETFINALPATHNAMEBYHANDLE_FLAGS(0))
         };
-    }
 
-    if result == 0 {
-        return Err(WholockError::Win32Error(WIN32_ERROR(0x0000000D)));
-    }
+        if result == 0 {
+            return Err(WholockError::Win32Error(unsafe { GetLastError() }));
+        }
 
-    let file_path = OsString::from_wide(&buf[..result as usize])
-        .to_string_lossy()
-        .trim_end_matches('\0')
-        .to_string();
-    Ok(strip_extended_path_prefix(&file_path))
+        let result = result as usize;
+        if result < buf.len() {
+            let file_path = OsString::from_wide(&buf[..result])
+                .to_string_lossy()
+                .to_string();
+            return Ok(strip_extended_path_prefix(&file_path));
+        }
+
+        buf.resize(result + 1, 0);
+    }
 }
 
 fn strip_extended_path_prefix(path: &str) -> String {
@@ -542,6 +538,7 @@ mod tests {
         assert!(result.is_ok());
         let path = result.unwrap();
         assert!(path.contains("test.txt"));
+        assert!(path.ends_with("test.txt"));
         assert!(!path.contains('\0'));
     }
 
