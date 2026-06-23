@@ -10,7 +10,6 @@ use crate::interop::{
 };
 use itertools::Itertools;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::Storage::FileSystem::{ReOpenFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, TerminateProcess};
 
 pub type WholockResult<T> = Result<T, WholockError>;
@@ -126,22 +125,7 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
                     continue;
                 }
 
-                let reopened_handle = unsafe {
-                    ReOpenFile(
-                        dup_handle.get(),
-                        0,
-                        FILE_SHARE_MODE(0),
-                        FILE_FLAGS_AND_ATTRIBUTES(0),
-                    )
-                };
-
-                if reopened_handle.is_err() || reopened_handle.as_ref().unwrap().is_invalid() {
-                    continue;
-                }
-
-                let reopened_handle = HandleWrapper::new(reopened_handle.unwrap());
-
-                if let Ok(full_name) = get_final_path_name_by_handle(&reopened_handle.get()) {
+                if let Ok(full_name) = get_final_path_name_by_handle(&dup_handle.get()) {
                     if matcher.matches(&full_name) {
                         process_info.locked_file.push(full_name);
                     }

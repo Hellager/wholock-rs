@@ -543,6 +543,34 @@ mod tests {
     }
 
     #[test]
+    fn test_get_final_path_name_by_exclusive_handle() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("exclusive.txt");
+        File::create(&file_path).unwrap();
+
+        let path_wide = wide_null(file_path.to_str().unwrap());
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(path_wide.as_ptr()),
+                0,
+                windows::Win32::Storage::FileSystem::FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
+                HANDLE::default(),
+            )
+        }
+        .unwrap();
+        let handle = SafeHandle::new(handle).unwrap();
+        let raw_handle = handle.as_raw();
+
+        let path = get_final_path_name_by_handle(&raw_handle).unwrap();
+
+        assert!(path.ends_with("exclusive.txt"));
+        assert!(!path.contains('\0'));
+    }
+
+    #[test]
     fn test_build_process_name_dict() {
         let result = build_process_name_dict();
         assert!(result.is_ok());
