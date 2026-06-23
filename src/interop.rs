@@ -9,6 +9,8 @@ use std::{
     path::Path,
     ptr::{self, addr_of},
     slice,
+    sync::mpsc::RecvTimeoutError,
+    time::Duration,
 };
 use windows::core::{PCWSTR, PWSTR};
 use windows::Wdk::Foundation::{NtQueryObject, ObjectTypeInformation};
@@ -40,6 +42,7 @@ pub(crate) const PROCESS_ACCESS_RIGHTS_DUP_HANDLE: PROCESS_ACCESS_RIGHTS =
     PROCESS_ACCESS_RIGHTS(0x0040);
 pub(crate) const PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION: PROCESS_ACCESS_RIGHTS =
     PROCESS_ACCESS_RIGHTS(0x0400);
+const DUPLICATE_HANDLE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[repr(C)]
 pub(crate) struct SystemHandleInformationEx {
@@ -172,13 +175,49 @@ pub(crate) fn duplicate_handle(
     handle_owner_process: windows::Win32::Foundation::HANDLE,
     handle: &HandleEntry,
 ) -> WholockResult<windows::Win32::Foundation::HANDLE> {
+    let current_process = current_process.0 as usize;
+    let handle_owner_process = handle_owner_process.0 as usize;
+    let source_handle = handle.handle_value() as usize;
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        match duplicate_handle_blocking(current_process, handle_owner_process, source_handle) {
+            Ok(handle) => {
+                if tx.send(Ok(handle)).is_err() {
+                    close_raw_handle(handle);
+                }
+            }
+            Err(err) => {
+                let _ = tx.send(Err(err));
+            }
+        }
+    });
+
+    match rx.recv_timeout(DUPLICATE_HANDLE_TIMEOUT) {
+        Ok(result) => {
+            result.map(|handle| windows::Win32::Foundation::HANDLE(handle as *mut c_void))
+        }
+        Err(RecvTimeoutError::Timeout) => Err(WholockError::HandleError(
+            "Timed out while duplicating handle".to_string(),
+        )),
+        Err(RecvTimeoutError::Disconnected) => Err(WholockError::HandleError(
+            "Handle duplication worker disconnected".to_string(),
+        )),
+    }
+}
+
+fn duplicate_handle_blocking(
+    current_process: usize,
+    handle_owner_process: usize,
+    source_handle: usize,
+) -> WholockResult<usize> {
     let mut target_handle: windows::Win32::Foundation::HANDLE =
         windows::Win32::Foundation::HANDLE(ptr::null_mut());
     let result = unsafe {
         DuplicateHandle(
-            handle_owner_process,
-            windows::Win32::Foundation::HANDLE(handle.handle_value()),
-            current_process,
+            windows::Win32::Foundation::HANDLE(handle_owner_process as *mut c_void),
+            windows::Win32::Foundation::HANDLE(source_handle as *mut c_void),
+            windows::Win32::Foundation::HANDLE(current_process as *mut c_void),
             &mut target_handle,
             0,
             false,
@@ -187,11 +226,17 @@ pub(crate) fn duplicate_handle(
     };
 
     match result {
-        Ok(_) => Ok(target_handle),
+        Ok(_) => Ok(target_handle.0 as usize),
         Err(_) => {
             let err = unsafe { windows::Win32::Foundation::GetLastError() };
             Err(WholockError::Win32Error(err))
         }
+    }
+}
+
+fn close_raw_handle(handle: usize) {
+    unsafe {
+        let _ = CloseHandle(windows::Win32::Foundation::HANDLE(handle as *mut c_void));
     }
 }
 
@@ -864,6 +909,33 @@ mod tests {
 
         assert_eq!(get_object_type_name(handle).unwrap(), "File");
         assert!(is_file_handle(handle));
+    }
+
+    #[test]
+    fn test_duplicate_handle() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("duplicate.txt");
+        File::create(&file_path).unwrap();
+
+        let file = File::open(&file_path).unwrap();
+        let current_process = unsafe { GetCurrentProcess() };
+        let entry = HandleEntry(SystemHandleTableEntryInfoEx {
+            object: std::ptr::null_mut(),
+            unique_process_id: std::process::id() as usize,
+            handle_value: file.as_raw_handle() as *mut c_void,
+            granted_access: 0,
+            creator_back_trace_index: 0,
+            object_type_index: 0,
+            handle_attributes: 0,
+            _reserved: 0,
+        });
+
+        let duplicated = duplicate_handle(current_process, current_process, &entry).unwrap();
+        assert!(!duplicated.is_invalid());
+
+        unsafe {
+            CloseHandle(duplicated).unwrap();
+        }
     }
 
     #[test]
