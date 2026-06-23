@@ -4,7 +4,7 @@ mod interop;
 use crate::error::WholockError;
 use crate::interop::{
     duplicate_handle, get_final_path_name_by_handle, get_handle_owner_info, get_handle_table,
-    get_process_info, query_system_information_buffer, LockedPathMatcher,
+    get_process_info, is_file_handle, query_system_information_buffer, LockedPathMatcher,
     PROCESS_ACCESS_RIGHTS_DUP_HANDLE, PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
     SYSTEM_EXTENDED_HANDLE_INFORMATION,
 };
@@ -122,6 +122,10 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
                     handle_entry,
                 )?);
                 if dup_handle.is_invalid() {
+                    continue;
+                }
+
+                if !is_file_handle(dup_handle.get()) {
                     continue;
                 }
 

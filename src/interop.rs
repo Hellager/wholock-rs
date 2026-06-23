@@ -13,6 +13,7 @@ use std::{
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_HANDLE_OPTIONS, HANDLE, MAX_PATH,
+    UNICODE_STRING,
 };
 use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
 use windows::Win32::Security::{LookupAccountSidW, SID_NAME_USE};
@@ -25,6 +26,7 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::{
+    Wdk::Foundation::{NtQueryObject, ObjectTypeInformation},
     Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS},
     Win32::Foundation::WIN32_ERROR,
 };
@@ -87,6 +89,11 @@ impl HandleEntry {
     fn handle_attributes(&self) -> c_ulong {
         self.0.handle_attributes
     }
+}
+
+#[repr(C)]
+struct ObjectTypeInformationPrefix {
+    name: UNICODE_STRING,
 }
 
 pub(crate) fn query_system_information_buffer(
@@ -180,6 +187,51 @@ pub(crate) fn duplicate_handle(
             Err(WholockError::Win32Error(err))
         }
     }
+}
+
+fn unicode_string_to_string(value: &UNICODE_STRING) -> String {
+    if value.Buffer.is_null() || value.Length == 0 {
+        return String::new();
+    }
+
+    let len = value.Length as usize / mem::size_of::<u16>();
+    unsafe { OsString::from_wide(slice::from_raw_parts(value.Buffer.0, len)) }
+        .to_string_lossy()
+        .to_string()
+}
+
+pub(crate) fn get_object_type_name(handle: HANDLE) -> WholockResult<String> {
+    let mut buffer = vec![0u8; 1024];
+
+    loop {
+        let mut return_length = 0;
+        let status = unsafe {
+            NtQueryObject(
+                handle,
+                ObjectTypeInformation,
+                Some(buffer.as_mut_ptr().cast()),
+                buffer.len() as u32,
+                Some(&mut return_length),
+            )
+        };
+
+        if status.is_ok() {
+            let info = unsafe { &*(buffer.as_ptr() as *const ObjectTypeInformationPrefix) };
+            return Ok(unicode_string_to_string(&info.name));
+        }
+
+        let return_length = return_length as usize;
+        if return_length > buffer.len() {
+            buffer.resize(return_length, 0);
+            continue;
+        }
+
+        return Err(WholockError::Win32Error(WIN32_ERROR(status.0 as u32)));
+    }
+}
+
+pub(crate) fn is_file_handle(handle: HANDLE) -> bool {
+    get_object_type_name(handle).is_ok_and(|type_name| type_name == "File")
 }
 
 pub(crate) fn get_final_path_name_by_handle(h_file: &HANDLE) -> WholockResult<String> {
@@ -540,6 +592,26 @@ mod tests {
         assert!(path.contains("test.txt"));
         assert!(path.ends_with("test.txt"));
         assert!(!path.contains('\0'));
+    }
+
+    #[test]
+    fn test_file_handle_type_detection() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("typed.txt");
+        File::create(&file_path).unwrap();
+
+        let file = File::open(&file_path).unwrap();
+        let handle = HANDLE(file.as_raw_handle() as _);
+
+        assert_eq!(get_object_type_name(handle).unwrap(), "File");
+        assert!(is_file_handle(handle));
+    }
+
+    #[test]
+    fn test_non_file_handle_type_detection() {
+        let current_process = unsafe { GetCurrentProcess() };
+
+        assert!(!is_file_handle(current_process));
     }
 
     #[test]
