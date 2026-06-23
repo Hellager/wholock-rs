@@ -17,7 +17,7 @@ use windows::Wdk::Foundation::{NtQueryObject, ObjectTypeInformation};
 use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS};
 use windows::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetLastError, SetLastError, DUPLICATE_HANDLE_OPTIONS,
-    ERROR_NOT_ALL_ASSIGNED, HANDLE, MAX_PATH, UNICODE_STRING, WIN32_ERROR,
+    ERROR_NONE_MAPPED, ERROR_NOT_ALL_ASSIGNED, HANDLE, MAX_PATH, UNICODE_STRING, WIN32_ERROR,
 };
 use windows::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
 use windows::Win32::Security::{
@@ -498,9 +498,11 @@ pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
         let mut token_handle: HANDLE = HANDLE::default();
         let result = OpenProcessToken(handle, TOKEN_QUERY, &mut token_handle);
         if result.is_err() {
-            return Err(std::io::Error::last_os_error().into());
+            return Ok(String::new());
         }
-        let token_handle = SafeHandle::new(token_handle)?;
+        let Ok(token_handle) = SafeHandle::new(token_handle) else {
+            return Ok(String::new());
+        };
 
         let mut token_info_len = 0;
         let _ = GetTokenInformation(
@@ -510,6 +512,9 @@ pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
             0,
             &mut token_info_len,
         );
+        if token_info_len == 0 {
+            return Ok(String::new());
+        }
 
         let mut token_info = vec![0u8; token_info_len as usize];
         if GetTokenInformation(
@@ -521,7 +526,7 @@ pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
         )
         .is_err()
         {
-            return Err(std::io::Error::last_os_error().into());
+            return Ok(String::new());
         }
 
         let token_user = &*(token_info.as_ptr() as *const TOKEN_USER);
@@ -531,7 +536,7 @@ pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
         let mut domain_size = 0u32;
         let mut sid_type = SID_NAME_USE::default();
 
-        let _ = LookupAccountSidW(
+        let lookup_probe = LookupAccountSidW(
             PCWSTR::null(),
             sid,
             PWSTR::null(),
@@ -540,6 +545,16 @@ pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
             &mut domain_size,
             &mut sid_type,
         );
+        if lookup_probe.is_err() {
+            let last_error = GetLastError();
+            if last_error == ERROR_NONE_MAPPED || name_size == 0 || domain_size == 0 {
+                return Ok(String::new());
+            }
+        }
+
+        if name_size == 0 || domain_size == 0 {
+            return Ok(String::new());
+        }
 
         let mut name = vec![0u16; name_size as usize];
         let mut domain = vec![0u16; domain_size as usize];
@@ -555,7 +570,7 @@ pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
         )
         .is_err()
         {
-            return Err(std::io::Error::last_os_error().into());
+            return Ok(String::new());
         }
 
         let name = String::from_utf16_lossy(&name[..name_size as usize]);
@@ -919,6 +934,13 @@ mod tests {
         let owner_info = result.unwrap();
         assert!(!owner_info.is_empty());
         assert!(owner_info.contains('\\'));
+    }
+
+    #[test]
+    fn test_get_handle_owner_info_returns_empty_on_lookup_failure() {
+        let owner_info = get_handle_owner_info(HANDLE::default()).unwrap();
+
+        assert!(owner_info.is_empty());
     }
 
     #[test]
