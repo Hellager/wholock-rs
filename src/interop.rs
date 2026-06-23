@@ -6,6 +6,7 @@ use std::{
         raw::{c_ulong, c_ushort},
         windows::ffi::OsStringExt,
     },
+    path::Path,
     ptr::{self, addr_of},
     slice,
 };
@@ -17,7 +18,8 @@ use windows::Win32::Foundation::{
 use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
 use windows::Win32::Security::{LookupAccountSidW, SID_NAME_USE};
 use windows::Win32::Storage::FileSystem::{
-    GetFinalPathNameByHandleW, GETFINALPATHNAMEBYHANDLE_FLAGS,
+    CreateFileW, GetFinalPathNameByHandleW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, GETFINALPATHNAMEBYHANDLE_FLAGS, OPEN_EXISTING,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_ACCESS_RIGHTS,
@@ -190,8 +192,8 @@ pub(crate) fn get_final_path_name_by_handle(h_file: &HANDLE) -> WholockResult<St
         return Err(WholockError::Win32Error(WIN32_ERROR(0x00000008)));
     }
 
-    if result as usize > buf.len() {
-        buf.resize(result as usize, 0);
+    if result as usize >= buf.len() {
+        buf.resize(result as usize + 1, 0);
         result = unsafe {
             GetFinalPathNameByHandleW(*h_file, &mut buf, GETFINALPATHNAMEBYHANDLE_FLAGS(0))
         };
@@ -201,27 +203,109 @@ pub(crate) fn get_final_path_name_by_handle(h_file: &HANDLE) -> WholockResult<St
         return Err(WholockError::Win32Error(WIN32_ERROR(0x0000000D)));
     }
 
-    let file_path = OsString::from_wide(&buf);
-    let file_path = file_path.to_string_lossy().to_string();
-    Ok(if file_path.starts_with(r"\\?\") {
-        file_path
-            .strip_prefix(r"\\?\")
-            .unwrap_or(&file_path)
-            .to_string()
+    let file_path = OsString::from_wide(&buf[..result as usize])
+        .to_string_lossy()
+        .trim_end_matches('\0')
+        .to_string();
+    Ok(strip_extended_path_prefix(&file_path))
+}
+
+fn strip_extended_path_prefix(path: &str) -> String {
+    if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", path)
+    } else if let Some(path) = path.strip_prefix(r"\\?\") {
+        path.to_string()
     } else {
-        file_path
-    })
+        path.to_string()
+    }
 }
 
 fn normalize_path(path: &str) -> String {
-    path.replace('/', "\\")
-        .to_lowercase()
-        .trim_start_matches(r"\\?\")
-        .to_string()
+    let mut path = strip_extended_path_prefix(path.trim_end_matches('\0')).replace('/', "\\");
+
+    while path.len() > 3 && path.ends_with('\\') {
+        path.pop();
+    }
+
+    path.to_lowercase()
 }
 
+fn wide_null(path: &str) -> Vec<u16> {
+    path.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn final_path_for_path(path: &str) -> WholockResult<String> {
+    let path_wide = wide_null(path);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path_wide.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            HANDLE::default(),
+        )
+    }?;
+    let handle = SafeHandle::new(handle)?;
+    let raw_handle = handle.as_raw();
+    get_final_path_name_by_handle(&raw_handle)
+}
+
+fn lexical_absolute_path(path: &str) -> String {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return path.to_string_lossy().to_string();
+    }
+
+    std::env::current_dir()
+        .map(|dir| dir.join(path).to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string_lossy().to_string())
+}
+
+fn directory_match_prefix(path: &str) -> String {
+    if path.ends_with('\\') {
+        path.to_string()
+    } else {
+        format!("{path}\\")
+    }
+}
+
+pub(crate) struct LockedPathMatcher {
+    target_path: String,
+    target_directory_prefix: Option<String>,
+}
+
+impl LockedPathMatcher {
+    pub(crate) fn new(target_path: &str) -> Self {
+        let resolved_path =
+            final_path_for_path(target_path).unwrap_or_else(|_| lexical_absolute_path(target_path));
+        let is_directory = std::fs::metadata(&resolved_path)
+            .or_else(|_| std::fs::metadata(target_path))
+            .ok()
+            .is_some_and(|metadata| metadata.is_dir());
+        let target_path = normalize_path(&resolved_path);
+        let target_directory_prefix = is_directory.then(|| directory_match_prefix(&target_path));
+
+        Self {
+            target_path,
+            target_directory_prefix,
+        }
+    }
+
+    pub(crate) fn matches(&self, path: &str) -> bool {
+        let path = normalize_path(path);
+        path == self.target_path
+            || self
+                .target_directory_prefix
+                .as_ref()
+                .is_some_and(|prefix| path.starts_with(prefix))
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn check_if_locked_file(path: &str, target_path: &str) -> bool {
-    normalize_path(path) == normalize_path(target_path)
+    LockedPathMatcher::new(target_path).matches(path)
 }
 
 pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
@@ -404,21 +488,33 @@ mod tests {
         assert!(!table.is_empty());
     }
 
-    // to be fixed
     #[test]
-    #[ignore]
     fn test_check_if_locked_file() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("locked.txt");
+        let sibling_dir = tempdir().unwrap();
+        let sibling_file_path = sibling_dir.path().join("locked.txt");
+        File::create(&file_path).unwrap();
+        File::create(&sibling_file_path).unwrap();
+
+        let file_final_path = final_path_for_path(file_path.to_str().unwrap()).unwrap();
+        let sibling_final_path = final_path_for_path(sibling_file_path.to_str().unwrap()).unwrap();
+
         assert!(check_if_locked_file(
-            r"C:\Users\test\file.txt",
-            r"C:\Users\test"
+            &file_final_path,
+            file_path.to_str().unwrap()
         ));
         assert!(check_if_locked_file(
-            r"C:\Users\test\file.txt",
-            r"c:\users\test\file.txt"
+            &file_final_path.replace('\\', "/"),
+            file_path.to_str().unwrap()
+        ));
+        assert!(check_if_locked_file(
+            &file_final_path,
+            dir.path().to_str().unwrap()
         ));
         assert!(!check_if_locked_file(
-            r"C:\Users\other\file.txt",
-            r"C:\Users\test"
+            &sibling_final_path,
+            dir.path().to_str().unwrap()
         ));
     }
 
@@ -446,6 +542,7 @@ mod tests {
         assert!(result.is_ok());
         let path = result.unwrap();
         assert!(path.contains("test.txt"));
+        assert!(!path.contains('\0'));
     }
 
     #[test]

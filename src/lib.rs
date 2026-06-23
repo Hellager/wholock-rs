@@ -3,8 +3,8 @@ mod interop;
 
 use crate::error::WholockError;
 use crate::interop::{
-    check_if_locked_file, duplicate_handle, get_final_path_name_by_handle, get_handle_owner_info,
-    get_handle_table, get_process_info, query_system_information_buffer,
+    duplicate_handle, get_final_path_name_by_handle, get_handle_owner_info, get_handle_table,
+    get_process_info, query_system_information_buffer, LockedPathMatcher,
     PROCESS_ACCESS_RIGHTS_DUP_HANDLE, PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
     SYSTEM_EXTENDED_HANDLE_INFORMATION,
 };
@@ -87,6 +87,7 @@ impl Drop for HandleWrapper {
 pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
     let current_process: windows::Win32::Foundation::HANDLE = unsafe { GetCurrentProcess() };
     let mut result: Vec<ProcessInfo> = vec![];
+    let matcher = LockedPathMatcher::new(path);
 
     let buffer = query_system_information_buffer(SYSTEM_EXTENDED_HANDLE_INFORMATION)?;
     let table = get_handle_table(&buffer);
@@ -141,7 +142,7 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
                 let reopened_handle = HandleWrapper::new(reopened_handle.unwrap());
 
                 if let Ok(full_name) = get_final_path_name_by_handle(&reopened_handle.get()) {
-                    if check_if_locked_file(&full_name, path) {
+                    if matcher.matches(&full_name) {
                         process_info.locked_file.push(full_name);
                     }
                 }
