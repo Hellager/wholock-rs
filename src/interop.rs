@@ -758,15 +758,21 @@ fn module_count_from_needed_bytes(needed: u32) -> usize {
 
 pub(crate) fn get_process_module_paths(pid: u32) -> WholockResult<Vec<String>> {
     unsafe {
-        let handle =
-            OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid).map_err(|e| {
-                WholockError::ProcessError(format!(
+        let handle = match OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) {
+            Ok(handle) => handle,
+            Err(e) => {
+                log::warn!(
                     "Failed to open process {} for module enumeration: {}",
                     pid,
                     get_win32_error_message(&WIN32_ERROR(e.code().0 as u32))
-                ))
-            })?;
-        let safe_handle = SafeHandle::new(handle)?;
+                );
+                return Ok(Vec::new());
+            }
+        };
+        let Ok(safe_handle) = SafeHandle::new(handle) else {
+            log::warn!("Failed to open process {pid} for module enumeration: invalid handle");
+            return Ok(Vec::new());
+        };
 
         let mut modules = vec![HMODULE::default(); INITIAL_MODULE_CAPACITY];
 
@@ -775,13 +781,19 @@ pub(crate) fn get_process_module_paths(pid: u32) -> WholockResult<Vec<String>> {
             let buffer_bytes = modules.len() * mem::size_of::<HMODULE>();
             let buffer_bytes = u32::try_from(buffer_bytes)
                 .map_err(|_| WholockError::Other("Module buffer is too large".to_string()))?;
-            EnumProcessModules(
+            if let Err(e) = EnumProcessModules(
                 safe_handle.as_raw(),
                 modules.as_mut_ptr(),
                 buffer_bytes,
                 &mut needed,
-            )
-            .map_err(|e| WholockError::Win32Error(WIN32_ERROR(e.code().0 as u32)))?;
+            ) {
+                log::warn!(
+                    "EnumProcessModules failed for PID {}: {}",
+                    pid,
+                    get_win32_error_message(&WIN32_ERROR(e.code().0 as u32))
+                );
+                return Ok(Vec::new());
+            }
 
             let needed_count = module_count_from_needed_bytes(needed);
             if needed > buffer_bytes {
@@ -1136,5 +1148,12 @@ mod tests {
         assert!(modules
             .iter()
             .any(|path| std::path::Path::new(path).exists()));
+    }
+
+    #[test_log::test]
+    fn test_missing_process_modules_returns_empty() {
+        let modules = get_process_module_paths(u32::MAX).unwrap();
+
+        assert!(modules.is_empty());
     }
 }
