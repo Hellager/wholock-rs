@@ -82,6 +82,9 @@ impl HandleEntry {
     fn handle_value(&self) -> *mut c_void {
         self.0.handle_value
     }
+    pub(crate) fn handle_value_raw(&self) -> usize {
+        self.0.handle_value as usize
+    }
     #[allow(dead_code)]
     fn granted_access(&self) -> c_ulong {
         self.0.granted_access
@@ -170,14 +173,26 @@ pub(crate) fn query_system_info() {
     debug!("system info");
 }
 
+#[cfg(test)]
 pub(crate) fn duplicate_handle(
     current_process: windows::Win32::Foundation::HANDLE,
     handle_owner_process: windows::Win32::Foundation::HANDLE,
     handle: &HandleEntry,
 ) -> WholockResult<windows::Win32::Foundation::HANDLE> {
+    duplicate_handle_value(
+        current_process,
+        handle_owner_process,
+        handle.handle_value_raw(),
+    )
+}
+
+pub(crate) fn duplicate_handle_value(
+    current_process: windows::Win32::Foundation::HANDLE,
+    handle_owner_process: windows::Win32::Foundation::HANDLE,
+    source_handle: usize,
+) -> WholockResult<windows::Win32::Foundation::HANDLE> {
     let current_process = current_process.0 as usize;
     let handle_owner_process = handle_owner_process.0 as usize;
-    let source_handle = handle.handle_value() as usize;
     let (tx, rx) = std::sync::mpsc::channel();
 
     std::thread::spawn(move || {

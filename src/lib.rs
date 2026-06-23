@@ -3,16 +3,17 @@ mod interop;
 
 use crate::error::WholockError;
 use crate::interop::{
-    duplicate_handle, enable_debug_privilege as enable_current_process_debug_privilege,
+    duplicate_handle_value, enable_debug_privilege as enable_current_process_debug_privilege,
     get_final_path_name_by_handle, get_handle_owner_info, get_handle_table, get_process_info,
     get_process_module_paths, is_file_handle, is_process_elevated as current_process_is_elevated,
     query_system_information_buffer, LockedPathMatchers, PROCESS_ACCESS_RIGHTS_DUP_HANDLE,
     PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION, SYSTEM_EXTENDED_HANDLE_INFORMATION,
 };
 use itertools::Itertools;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
+use std::sync::{Arc, Mutex};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, WIN32_ERROR};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, TerminateProcess};
@@ -155,16 +156,28 @@ pub fn restart_as_elevated() -> WholockResult<()> {
 
 struct ProcessLockCollector {
     pid: u32,
-    open_process: Option<HandleWrapper>,
+    domain_username: Option<String>,
     locked_files: BTreeSet<String>,
 }
 
 impl ProcessLockCollector {
-    fn new(pid: u32, open_process: Option<HandleWrapper>) -> Self {
+    fn new(pid: u32) -> Self {
         Self {
             pid,
-            open_process,
+            domain_username: None,
             locked_files: BTreeSet::new(),
+        }
+    }
+
+    fn with_locked_files(
+        pid: u32,
+        domain_username: Option<String>,
+        locked_files: BTreeSet<String>,
+    ) -> Self {
+        Self {
+            pid,
+            domain_username,
+            locked_files,
         }
     }
 
@@ -173,11 +186,7 @@ impl ProcessLockCollector {
     }
 
     fn into_process_info(self) -> ProcessInfo {
-        let domain_username = self
-            .open_process
-            .as_ref()
-            .and_then(|process| get_handle_owner_info(process.get()).ok())
-            .unwrap_or_default();
+        let domain_username = self.domain_username.unwrap_or_default();
         let (process_name, process_exe_path) = get_process_info(self.pid).unwrap_or_default();
 
         ProcessInfo {
@@ -188,6 +197,112 @@ impl ProcessLockCollector {
             locked_file: self.locked_files.into_iter().collect(),
         }
     }
+}
+
+fn handle_scan_worker_count(task_count: usize) -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4);
+    available.clamp(1, task_count.max(1))
+}
+
+fn collect_handle_locks_parallel(
+    handle_groups: Vec<(u32, Vec<usize>)>,
+    matchers: Arc<LockedPathMatchers>,
+) -> BTreeMap<u32, ProcessLockCollector> {
+    if handle_groups.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let worker_count = handle_scan_worker_count(handle_groups.len());
+    let queue = Arc::new(Mutex::new(VecDeque::from(handle_groups)));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut workers = Vec::with_capacity(worker_count);
+
+    for _ in 0..worker_count {
+        let queue = Arc::clone(&queue);
+        let tx = tx.clone();
+        let matchers = Arc::clone(&matchers);
+        workers.push(std::thread::spawn(move || loop {
+            let task = queue.lock().ok().and_then(|mut queue| queue.pop_front());
+            let Some((pid, handle_values)) = task else {
+                break;
+            };
+
+            if let Some(process_info) = scan_process_handles(pid, &handle_values, &matchers) {
+                let _ = tx.send(process_info);
+            }
+        }));
+    }
+
+    drop(tx);
+
+    let mut result = BTreeMap::new();
+    for process_info in rx {
+        result.insert(process_info.pid, process_info);
+    }
+
+    for worker in workers {
+        let _ = worker.join();
+    }
+
+    result
+}
+
+fn scan_process_handles(
+    pid: u32,
+    handle_values: &[usize],
+    matchers: &LockedPathMatchers,
+) -> Option<ProcessLockCollector> {
+    let Ok(open_process) = (unsafe {
+        OpenProcess(
+            PROCESS_ACCESS_RIGHTS_DUP_HANDLE | PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
+            false,
+            pid,
+        )
+    }) else {
+        return None;
+    };
+    let open_process = HandleWrapper::new(open_process);
+    if open_process.is_invalid() {
+        return None;
+    }
+
+    let current_process: windows::Win32::Foundation::HANDLE = unsafe { GetCurrentProcess() };
+    let mut locked_files = BTreeSet::new();
+
+    for handle_value in handle_values {
+        let Ok(dup_handle) =
+            duplicate_handle_value(current_process, open_process.get(), *handle_value)
+        else {
+            continue;
+        };
+        let dup_handle = HandleWrapper::new(dup_handle);
+        if dup_handle.is_invalid() {
+            continue;
+        }
+
+        if !is_file_handle(dup_handle.get()) {
+            continue;
+        }
+
+        if let Ok(full_name) = get_final_path_name_by_handle(&dup_handle.get()) {
+            if matchers.matches(&full_name) {
+                locked_files.insert(full_name);
+            }
+        }
+    }
+
+    if locked_files.is_empty() {
+        return None;
+    }
+
+    let domain_username = get_handle_owner_info(open_process.get()).ok();
+    Some(ProcessLockCollector::with_locked_files(
+        pid,
+        domain_username,
+        locked_files,
+    ))
 }
 
 /// Identifies all processes that have locked a specified file.
@@ -257,63 +372,23 @@ where
 
     let _ = enable_debug_privilege();
 
-    let current_process: windows::Win32::Foundation::HANDLE = unsafe { GetCurrentProcess() };
     let mut result: BTreeMap<u32, ProcessLockCollector> = BTreeMap::new();
+    let matchers = Arc::new(matchers);
 
     let buffer = query_system_information_buffer(SYSTEM_EXTENDED_HANDLE_INFORMATION)?;
     let table = get_handle_table(&buffer);
-
-    for (pid, handles) in table
+    let handle_groups = table
         .iter()
-        .into_group_map_by(|elt| elt.unique_process_id())
-    {
-        let Ok(pid) = u32::try_from(pid) else {
-            continue;
-        };
+        .filter_map(|handle| {
+            let pid = u32::try_from(handle.unique_process_id()).ok()?;
+            Some((pid, handle.handle_value_raw()))
+        })
+        .into_group_map();
 
-        if let Ok(open_process) = unsafe {
-            OpenProcess(
-                PROCESS_ACCESS_RIGHTS_DUP_HANDLE | PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
-                false,
-                pid,
-            )
-        } {
-            let open_process = HandleWrapper::new(open_process);
-            if open_process.is_invalid() {
-                continue;
-            }
-
-            let mut process_info = ProcessLockCollector::new(pid, None);
-
-            for handle in handles.iter() {
-                let handle_entry = *handle;
-                let Ok(dup_handle) =
-                    duplicate_handle(current_process, open_process.get(), handle_entry)
-                else {
-                    continue;
-                };
-                let dup_handle = HandleWrapper::new(dup_handle);
-                if dup_handle.is_invalid() {
-                    continue;
-                }
-
-                if !is_file_handle(dup_handle.get()) {
-                    continue;
-                }
-
-                if let Ok(full_name) = get_final_path_name_by_handle(&dup_handle.get()) {
-                    if matchers.matches(&full_name) {
-                        process_info.insert_path(full_name);
-                    }
-                }
-            }
-
-            if !process_info.locked_files.is_empty() {
-                process_info.open_process = Some(open_process);
-                result.insert(pid, process_info);
-            }
-        }
-    }
+    result.extend(collect_handle_locks_parallel(
+        handle_groups.into_iter().collect(),
+        Arc::clone(&matchers),
+    ));
 
     let system = sysinfo::System::new_all();
     for pid in system
@@ -326,7 +401,7 @@ where
                 if matchers.matches(&module_path) {
                     result
                         .entry(pid)
-                        .or_insert_with(|| ProcessLockCollector::new(pid, None))
+                        .or_insert_with(|| ProcessLockCollector::new(pid))
                         .insert_path(module_path);
                 }
             }
