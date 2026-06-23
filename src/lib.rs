@@ -54,6 +54,7 @@ impl UnlockProcessResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessTerminationFailureKind {
     InvalidPid,
+    ProtectedProcess,
     OpenProcess,
     TerminateProcess,
 }
@@ -69,6 +70,12 @@ impl ProcessTerminationFailure {
     fn to_wholock_error(&self) -> WholockError {
         match self.kind {
             ProcessTerminationFailureKind::InvalidPid => WholockError::InvalidPID(self.pid),
+            ProcessTerminationFailureKind::ProtectedProcess => {
+                WholockError::PermissionError(format!(
+                    "Refusing to terminate protected system process {}: {}",
+                    self.pid, self.reason
+                ))
+            }
             ProcessTerminationFailureKind::OpenProcess => WholockError::ProcessError(format!(
                 "Failed to open process {} for termination: {}",
                 self.pid, self.reason
@@ -582,8 +589,24 @@ fn sanitize_pid(pid: u32) -> WholockResult<()> {
     Ok(())
 }
 
+fn protected_system_process_reason(pid: u32) -> Option<&'static str> {
+    match pid {
+        0 => Some("System Idle Process"),
+        4 => Some("System process"),
+        _ => None,
+    }
+}
+
 fn terminate_process_by_pid_detailed(pid: u32) -> Result<(), ProcessTerminationFailure> {
     use windows::Win32::System::Threading::PROCESS_TERMINATE;
+
+    if let Some(reason) = protected_system_process_reason(pid) {
+        return Err(ProcessTerminationFailure {
+            pid,
+            kind: ProcessTerminationFailureKind::ProtectedProcess,
+            reason: reason.to_string(),
+        });
+    }
 
     if let Err(err) = sanitize_pid(pid) {
         return Err(ProcessTerminationFailure {
@@ -797,6 +820,36 @@ mod tests {
         assert!(matches!(
             &results[0].result,
             Err(WholockError::InvalidPID(pid)) if *pid == u32::MAX
+        ));
+    }
+
+    #[test]
+    fn test_unlock_file_rejects_protected_system_pid() {
+        let result = unlock_file(4);
+
+        assert!(matches!(result, Err(WholockError::PermissionError(_))));
+    }
+
+    #[test]
+    fn test_unlock_processes_reports_protected_system_pid() {
+        let processes = vec![ProcessInfo {
+            pid: 4,
+            process_name: "System".to_string(),
+            process_exe_path: String::new(),
+            domain_username: String::new(),
+            locked_file: Vec::new(),
+        }];
+
+        let results = unlock_processes(&processes);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].failure.as_ref().map(|failure| failure.kind),
+            Some(ProcessTerminationFailureKind::ProtectedProcess)
+        );
+        assert!(matches!(
+            &results[0].result,
+            Err(WholockError::PermissionError(_))
         ));
     }
 
