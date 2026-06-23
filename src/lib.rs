@@ -4,11 +4,12 @@ mod interop;
 use crate::error::WholockError;
 use crate::interop::{
     duplicate_handle, get_final_path_name_by_handle, get_handle_owner_info, get_handle_table,
-    get_process_info, is_file_handle, query_system_information_buffer, target_path_is_missing,
-    LockedPathMatcher, PROCESS_ACCESS_RIGHTS_DUP_HANDLE, PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
-    SYSTEM_EXTENDED_HANDLE_INFORMATION,
+    get_process_info, get_process_module_paths, is_file_handle, query_system_information_buffer,
+    target_path_is_missing, LockedPathMatcher, PROCESS_ACCESS_RIGHTS_DUP_HANDLE,
+    PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION, SYSTEM_EXTENDED_HANDLE_INFORMATION,
 };
 use itertools::Itertools;
+use std::collections::{BTreeMap, BTreeSet};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, TerminateProcess};
 
@@ -45,6 +46,43 @@ impl Drop for HandleWrapper {
             unsafe {
                 let _ = CloseHandle(self.0);
             }
+        }
+    }
+}
+
+struct ProcessLockCollector {
+    pid: u32,
+    open_process: Option<HandleWrapper>,
+    locked_files: BTreeSet<String>,
+}
+
+impl ProcessLockCollector {
+    fn new(pid: u32, open_process: Option<HandleWrapper>) -> Self {
+        Self {
+            pid,
+            open_process,
+            locked_files: BTreeSet::new(),
+        }
+    }
+
+    fn insert_path(&mut self, path: String) {
+        self.locked_files.insert(path);
+    }
+
+    fn into_process_info(self) -> ProcessInfo {
+        let domain_username = self
+            .open_process
+            .as_ref()
+            .and_then(|process| get_handle_owner_info(process.get()).ok())
+            .unwrap_or_default();
+        let (process_name, process_exe_path) = get_process_info(self.pid).unwrap_or_default();
+
+        ProcessInfo {
+            pid: self.pid,
+            process_name,
+            process_exe_path,
+            domain_username,
+            locked_file: self.locked_files.into_iter().collect(),
         }
     }
 }
@@ -89,7 +127,7 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
     }
 
     let current_process: windows::Win32::Foundation::HANDLE = unsafe { GetCurrentProcess() };
-    let mut result: Vec<ProcessInfo> = vec![];
+    let mut result: BTreeMap<u32, ProcessLockCollector> = BTreeMap::new();
     let matcher = LockedPathMatcher::new(path);
 
     let buffer = query_system_information_buffer(SYSTEM_EXTENDED_HANDLE_INFORMATION)?;
@@ -115,13 +153,7 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
                 continue;
             }
 
-            let mut process_info = ProcessInfo {
-                pid,
-                process_name: "".to_string(),
-                process_exe_path: "".to_string(),
-                domain_username: "".to_string(),
-                locked_file: vec![],
-            };
+            let mut process_info = ProcessLockCollector::new(pid, None);
 
             for handle in handles.iter() {
                 let handle_entry = *handle;
@@ -141,26 +173,40 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
 
                 if let Ok(full_name) = get_final_path_name_by_handle(&dup_handle.get()) {
                     if matcher.matches(&full_name) {
-                        process_info.locked_file.push(full_name);
+                        process_info.insert_path(full_name);
                     }
                 }
             }
 
-            if !process_info.locked_file.is_empty() {
-                process_info.domain_username =
-                    get_handle_owner_info(open_process.get()).unwrap_or_default();
-
-                if let Ok((name, path)) = get_process_info(pid) {
-                    process_info.process_name = name;
-                    process_info.process_exe_path = path;
-                }
-
-                result.push(process_info);
+            if !process_info.locked_files.is_empty() {
+                process_info.open_process = Some(open_process);
+                result.insert(pid, process_info);
             }
         }
     }
 
-    Ok(result)
+    let system = sysinfo::System::new_all();
+    for pid in system
+        .processes()
+        .keys()
+        .map(|pid| usize::from(*pid) as u32)
+    {
+        if let Ok(module_paths) = get_process_module_paths(pid) {
+            for module_path in module_paths {
+                if matcher.matches(&module_path) {
+                    result
+                        .entry(pid)
+                        .or_insert_with(|| ProcessLockCollector::new(pid, None))
+                        .insert_path(module_path);
+                }
+            }
+        }
+    }
+
+    Ok(result
+        .into_values()
+        .map(ProcessLockCollector::into_process_info)
+        .collect())
 }
 
 fn sanitize_pid(pid: u32) -> WholockResult<()> {

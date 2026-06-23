@@ -21,9 +21,10 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFinalPathNameByHandleW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, GETFINALPATHNAMEBYHANDLE_FLAGS, OPEN_EXISTING,
 };
+use windows::Win32::System::ProcessStatus::{EnumProcessModules, GetModuleFileNameExW};
 use windows::Win32::System::Threading::{
     OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_ACCESS_RIGHTS,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
 };
 use windows::{
     Wdk::Foundation::{NtQueryObject, ObjectTypeInformation},
@@ -529,6 +530,59 @@ pub(crate) fn get_process_info(pid: u32) -> WholockResult<(String, String)> {
     }
 }
 
+pub(crate) fn get_process_module_paths(pid: u32) -> WholockResult<Vec<String>> {
+    unsafe {
+        let handle =
+            OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid).map_err(|e| {
+                WholockError::ProcessError(format!(
+                    "Failed to open process {} for module enumeration: {}",
+                    pid,
+                    get_win32_error_message(&WIN32_ERROR(e.code().0 as u32))
+                ))
+            })?;
+        let safe_handle = SafeHandle::new(handle)?;
+
+        let mut modules = vec![windows::Win32::Foundation::HMODULE::default(); 256];
+
+        loop {
+            let mut needed = 0u32;
+            EnumProcessModules(
+                safe_handle.as_raw(),
+                modules.as_mut_ptr(),
+                (modules.len() * mem::size_of::<windows::Win32::Foundation::HMODULE>()) as u32,
+                &mut needed,
+            )
+            .map_err(|e| WholockError::Win32Error(WIN32_ERROR(e.code().0 as u32)))?;
+
+            let needed_count =
+                needed as usize / mem::size_of::<windows::Win32::Foundation::HMODULE>();
+            if needed_count <= modules.len() {
+                modules.truncate(needed_count);
+                break;
+            }
+
+            modules.resize(needed_count, windows::Win32::Foundation::HMODULE::default());
+        }
+
+        let mut paths = Vec::new();
+        for module in modules {
+            let mut buffer = vec![0u16; MAX_PATH as usize + 1];
+            let len = GetModuleFileNameExW(safe_handle.as_raw(), module, &mut buffer);
+            if len == 0 {
+                continue;
+            }
+
+            if let Ok(path) = convert_wide_buffer(&buffer, len as usize) {
+                if !path.is_empty() {
+                    paths.push(strip_extended_path_prefix(&path));
+                }
+            }
+        }
+
+        Ok(paths)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,5 +811,15 @@ mod tests {
                 .to_str()
                 .unwrap()
         );
+    }
+
+    #[test_log::test]
+    fn test_current_process_modules() {
+        let modules = get_process_module_paths(std::process::id()).unwrap();
+
+        assert!(!modules.is_empty());
+        assert!(modules
+            .iter()
+            .any(|path| std::path::Path::new(path).exists()));
     }
 }
