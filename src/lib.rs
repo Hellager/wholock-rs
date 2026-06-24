@@ -17,7 +17,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, WIN32_ERROR};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, TerminateProcess};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -274,7 +274,7 @@ pub fn start_as_elevated() -> WholockResult<()> {
 
     let code = result.0 as usize;
     if code <= 32 {
-        return Err(WIN32_ERROR(code as u32).into());
+        return Err(WholockError::elevation_start(code));
     }
 
     Ok(())
@@ -995,6 +995,18 @@ mod tests {
             quote_windows_arg_from_str(r#"C:\path with space\"#),
             r#""C:\path with space\\""#
         );
+    }
+
+    #[test]
+    fn test_elevation_start_error_uses_shell_execute_code() {
+        let error = WholockError::elevation_start(5);
+
+        assert!(matches!(
+            error,
+            WholockError::ElevationStartError(shell_error)
+                if shell_error.code() == 5
+                    && shell_error.description().contains("Access was denied")
+        ));
     }
 
     #[test]
