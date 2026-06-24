@@ -588,7 +588,7 @@ where
     let matchers = Arc::new(matchers);
 
     let buffer = query_system_information_buffer(SYSTEM_EXTENDED_HANDLE_INFORMATION)?;
-    let table = get_handle_table(&buffer);
+    let table = get_handle_table(&buffer)?;
     let handle_groups = table
         .iter()
         .filter_map(|handle| {

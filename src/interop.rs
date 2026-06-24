@@ -143,7 +143,15 @@ pub(crate) fn query_system_information_buffer(
     }
 }
 
-pub(crate) fn get_handle_table(buffer: &[u8]) -> &[HandleEntry] {
+pub(crate) fn get_handle_table(buffer: &[u8]) -> WholockResult<&[HandleEntry]> {
+    let header_size = 2 * mem::size_of::<usize>();
+    if buffer.len() < header_size {
+        return Err(WholockError::system_info(format!(
+            "System handle information buffer is too small: {} bytes",
+            buffer.len()
+        )));
+    }
+
     let info_ptr: *const SystemHandleInformationEx = buffer.as_ptr().cast();
     // SAFETY: `buffer` comes from NtQuerySystemInformation for
     // SystemExtendedHandleInformation and is large enough to contain the fixed
@@ -156,19 +164,38 @@ pub(crate) fn get_handle_table(buffer: &[u8]) -> &[HandleEntry] {
     // SAFETY: `table_ptr` is derived from `buffer.as_ptr()`, so offset_from is
     // computed between pointers into the same allocation.
     let table_offset = unsafe { table_ptr.cast::<u8>().offset_from(buffer.as_ptr()) };
-    let max_len = (buffer.len() - table_offset as usize) / mem::size_of::<HandleEntry>();
-    assert!(len <= max_len);
-    // SAFETY: The assertion above verifies the advertised handle count fits in
+    let table_offset = usize::try_from(table_offset).map_err(|_| {
+        WholockError::system_info("System handle table offset was negative".to_string())
+    })?;
+    if table_offset > buffer.len() {
+        return Err(WholockError::system_info(format!(
+            "System handle table offset {table_offset} exceeds buffer length {}",
+            buffer.len()
+        )));
+    }
+
+    let max_len = (buffer.len() - table_offset) / mem::size_of::<HandleEntry>();
+    if len > max_len {
+        return Err(WholockError::system_info(format!(
+            "System handle table reports {len} entries but buffer can hold {max_len}"
+        )));
+    }
+
+    // SAFETY: The checks above verify the advertised handle count fits in
     // the returned buffer. `HandleEntry` is repr(transparent) over the NT entry.
-    unsafe { slice::from_raw_parts(table_ptr, len) }
+    Ok(unsafe { slice::from_raw_parts(table_ptr, len) })
 }
 
 #[allow(dead_code)]
 pub(crate) fn query_system_info() {
     use log::debug;
 
-    let buffer = query_system_information_buffer(SYSTEM_EXTENDED_HANDLE_INFORMATION).unwrap();
-    let table = get_handle_table(&buffer);
+    let Ok(buffer) = query_system_information_buffer(SYSTEM_EXTENDED_HANDLE_INFORMATION) else {
+        return;
+    };
+    let Ok(table) = get_handle_table(&buffer) else {
+        return;
+    };
     for (i, entry) in table.iter().enumerate() {
         debug!("entry {i}:");
         debug!("  Object = {:p}", entry.object());
@@ -867,8 +894,26 @@ mod tests {
     #[test]
     fn test_get_handle_table() {
         let buffer = query_system_information_buffer(SYSTEM_EXTENDED_HANDLE_INFORMATION).unwrap();
-        let table = get_handle_table(&buffer);
+        let table = get_handle_table(&buffer).unwrap();
         assert!(!table.is_empty());
+    }
+
+    #[test]
+    fn test_get_handle_table_rejects_short_buffer() {
+        let result = get_handle_table(&[]);
+
+        assert!(matches!(result, Err(WholockError::SystemInfoError(_))));
+    }
+
+    #[test]
+    fn test_get_handle_table_rejects_overreported_count() {
+        let mut buffer = vec![0u8; 2 * mem::size_of::<usize>()];
+        let count = 1usize.to_ne_bytes();
+        buffer[..count.len()].copy_from_slice(&count);
+
+        let result = get_handle_table(&buffer);
+
+        assert!(matches!(result, Err(WholockError::SystemInfoError(_))));
     }
 
     #[test]
