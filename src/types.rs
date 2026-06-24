@@ -1,4 +1,7 @@
-use crate::{WholockResult, error::WholockError};
+use crate::{
+    WholockResult,
+    error::{LockScanWarning, WholockError},
+};
 use serde::Serialize;
 use std::time::Duration;
 
@@ -19,6 +22,74 @@ pub struct ProcessInfo {
     pub domain_username: String,
     /// Matching file or module paths held by the process.
     pub locked_file: Vec<String>,
+}
+
+/// Options controlling how file lock scans are performed.
+///
+/// The default configuration follows PowerToys File Locksmith's behavior: wholock
+/// attempts to enable debug privilege to improve visibility, but continues with a
+/// best-effort scan if the privilege is unavailable.
+#[derive(Debug, Clone)]
+pub struct LockScanOptions {
+    /// Whether failing to enable `SeDebugPrivilege` should abort the scan.
+    pub require_debug_privilege: bool,
+    /// Whether loaded process modules should be scanned in addition to open handles.
+    pub include_modules: bool,
+    /// Maximum time spent probing one duplicated handle before recording a warning.
+    pub handle_probe_timeout: Duration,
+}
+
+impl Default for LockScanOptions {
+    fn default() -> Self {
+        Self {
+            require_debug_privilege: false,
+            include_modules: true,
+            handle_probe_timeout: Duration::from_millis(200),
+        }
+    }
+}
+
+/// Structured result returned by lock scan APIs.
+///
+/// `processes` contains every lock holder discovered during the scan. `warnings`
+/// contains recoverable failures, such as inaccessible processes or a missing debug
+/// privilege, that may make the result incomplete.
+#[derive(Debug, Clone)]
+pub struct LockScanResult {
+    /// Processes that matched the requested locked paths.
+    pub processes: Vec<ProcessInfo>,
+    /// Recoverable scan failures that may have hidden additional lock holders.
+    pub warnings: Vec<LockScanWarning>,
+}
+
+impl LockScanResult {
+    /// Creates a scan result from discovered processes and warnings.
+    #[must_use]
+    pub fn new(processes: Vec<ProcessInfo>, warnings: Vec<LockScanWarning>) -> Self {
+        Self {
+            processes,
+            warnings,
+        }
+    }
+
+    /// Returns whether the scan finished without recoverable warnings.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` when [`LockScanResult::warnings`] is empty.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.warnings.is_empty()
+    }
+
+    /// Consumes the scan result and returns only the discovered processes.
+    ///
+    /// This is a convenience for callers that intentionally ignore partial-scan
+    /// warnings.
+    #[must_use]
+    pub fn into_processes(self) -> Vec<ProcessInfo> {
+        self.processes
+    }
 }
 
 /// Result for one process termination attempt made by [`unlock_processes`](crate::unlock_processes).
@@ -136,6 +207,8 @@ pub struct WaitForUnlockResult {
     pub elapsed: Duration,
     /// Lock holders still present when the wait timed out.
     pub remaining_locks: Vec<ProcessInfo>,
+    /// Recoverable scan failures observed while polling.
+    pub warnings: Vec<LockScanWarning>,
 }
 
 impl WaitForUnlockResult {

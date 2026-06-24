@@ -89,9 +89,12 @@ where
         .map(|path| path.as_ref().to_string())
         .collect::<Vec<_>>();
     let start = Instant::now();
+    let mut warnings = Vec::new();
 
     loop {
-        let remaining_locks = find_processes_recursive(paths.iter().map(String::as_str))?;
+        let scan = find_processes_recursive(paths.iter().map(String::as_str))?;
+        warnings.extend(scan.warnings);
+        let remaining_locks = scan.processes;
         let elapsed = start.elapsed();
 
         if remaining_locks.is_empty() {
@@ -99,6 +102,7 @@ where
                 unlocked: true,
                 elapsed,
                 remaining_locks,
+                warnings,
             });
         }
 
@@ -107,6 +111,7 @@ where
                 unlocked: false,
                 elapsed,
                 remaining_locks,
+                warnings,
             });
         }
 

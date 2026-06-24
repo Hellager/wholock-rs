@@ -43,9 +43,9 @@ use wholock::{who_locks_file, WholockError};
 fn main() -> Result<(), WholockError> {
     let target = r"C:\critical\database.lock";
   
-    let processes = who_locks_file(target)?;
+    let scan = who_locks_file(target)?;
   
-    processes.iter().for_each(|p| {
+    scan.processes.iter().for_each(|p| {
         println!("🔒 Process {} (PID: {}) locks:", p.process_name, p.pid);
         p.locked_file.iter().for_each(|f| println!("   - {}", f));
     });
@@ -79,10 +79,10 @@ async fn monitor_locks(path: &str) -> wholock::WholockResult<()> {
   
     loop {
         interval.tick().await;
-        let locks = who_locks_file(path)?;
+        let scan = who_locks_file(path)?;
       
-        if !locks.is_empty() {
-            send_alert(&locks).await?;
+        if !scan.processes.is_empty() {
+            send_alert(&scan.processes).await?;
         }
     }
 }

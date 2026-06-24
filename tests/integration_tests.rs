@@ -5,7 +5,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 use wholock::ProcessInfo;
-use wholock::error::WholockError;
 use wholock::{unlock_file, who_locks_file};
 
 const LOCK_HELPER_PATH_ENV: &str = "WHOLOCK_E2E_LOCK_PATH";
@@ -21,14 +20,7 @@ fn create_locked_file() -> (tempfile::TempDir, String, File) {
 
 fn scan_processes(path: &str) -> Vec<ProcessInfo> {
     match who_locks_file(path) {
-        Ok(processes) => processes,
-        Err(WholockError::PartialLockScan { processes, .. }) => processes,
-        Err(WholockError::PermissionError(message))
-            if message.message().contains("SeDebugPrivilege") =>
-        {
-            eprintln!("skipping real lock scan assertion: {message}");
-            Vec::new()
-        }
+        Ok(scan) => scan.processes,
         Err(err) => panic!("lock scan failed: {err:?}"),
     }
 }

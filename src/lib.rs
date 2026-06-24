@@ -18,10 +18,10 @@ pub use elevation::{
     enable_debug_privilege, is_process_elevated, restart_as_elevated, start_as_elevated,
 };
 pub use json::processes_to_json;
-pub use scan::{find_processes_recursive, who_locks_file, who_locks_files};
+pub use scan::{find_processes_recursive, scan_locks, who_locks_file, who_locks_files};
 pub use types::{
-    ProcessInfo, ProcessTerminationFailure, ProcessTerminationFailureKind, UnlockProcessResult,
-    WaitForUnlockResult,
+    LockScanOptions, LockScanResult, ProcessInfo, ProcessTerminationFailure,
+    ProcessTerminationFailureKind, UnlockProcessResult, WaitForUnlockResult,
 };
 pub use unlock::{unlock_file, unlock_processes};
 pub use wait::{wait_for_unlock, wait_for_unlock_files};

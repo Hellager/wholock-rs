@@ -6,7 +6,10 @@ use crate::interop::{
     get_handle_owner_info, get_handle_table, get_process_info, get_process_module_paths,
     is_file_handle, query_system_information_buffer,
 };
-use crate::{WholockResult, types::ProcessInfo};
+use crate::{
+    WholockResult,
+    types::{LockScanOptions, LockScanResult, ProcessInfo},
+};
 use itertools::Itertools;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::AssertUnwindSafe;
@@ -19,7 +22,6 @@ use std::time::Duration;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess};
 
-const HANDLE_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 const MAX_ACTIVE_HANDLE_PROBE_WORKERS: usize = 32;
 static ACTIVE_HANDLE_PROBE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
@@ -158,8 +160,12 @@ fn probe_handle_path_blocking(pid: u32, source_handle: usize) -> WholockResult<O
     Ok(get_final_path_name_by_handle(&dup_handle.get()).ok())
 }
 
-fn probe_handle_path_with_timeout(pid: u32, source_handle: usize) -> HandleProbeOutcome {
-    run_handle_probe_with_timeout(HANDLE_PROBE_TIMEOUT, move || {
+fn probe_handle_path_with_timeout(
+    pid: u32,
+    source_handle: usize,
+    timeout: Duration,
+) -> HandleProbeOutcome {
+    run_handle_probe_with_timeout(timeout, move || {
         probe_handle_path_blocking(pid, source_handle)
     })
 }
@@ -219,6 +225,7 @@ fn handle_scan_worker_count(task_count: usize) -> usize {
 fn collect_handle_locks_parallel(
     handle_groups: Vec<(u32, Vec<usize>)>,
     matchers: Arc<LockedPathMatchers>,
+    handle_probe_timeout: Duration,
 ) -> (BTreeMap<u32, ProcessLockCollector>, Vec<LockScanWarning>) {
     if handle_groups.is_empty() {
         return (BTreeMap::new(), Vec::new());
@@ -240,7 +247,8 @@ fn collect_handle_locks_parallel(
                     break;
                 };
 
-                let scan_result = scan_process_handles(pid, &handle_values, &matchers);
+                let scan_result =
+                    scan_process_handles(pid, &handle_values, &matchers, handle_probe_timeout);
                 let _ = tx.send(scan_result);
             }
         }));
@@ -281,33 +289,23 @@ impl ProcessHandleScanResult {
     }
 }
 
-fn partial_scan_error(processes: Vec<ProcessInfo>, warnings: Vec<LockScanWarning>) -> WholockError {
-    WholockError::PartialLockScan {
-        processes,
-        warnings,
-    }
-}
-
 fn finish_lock_scan(
     result: BTreeMap<u32, ProcessLockCollector>,
     warnings: Vec<LockScanWarning>,
-) -> WholockResult<Vec<ProcessInfo>> {
+) -> LockScanResult {
     let processes = result
         .into_values()
         .map(ProcessLockCollector::into_process_info)
         .collect::<Vec<_>>();
 
-    if warnings.is_empty() {
-        Ok(processes)
-    } else {
-        Err(partial_scan_error(processes, warnings))
-    }
+    LockScanResult::new(processes, warnings)
 }
 
 fn scan_process_handles(
     pid: u32,
     handle_values: &[usize],
     matchers: &LockedPathMatchers,
+    handle_probe_timeout: Duration,
 ) -> ProcessHandleScanResult {
     if let Err(warning) = verify_process_can_be_scanned(pid) {
         return ProcessHandleScanResult {
@@ -320,7 +318,7 @@ fn scan_process_handles(
     let mut warnings = Vec::new();
 
     for handle_value in handle_values {
-        match probe_handle_path_with_timeout(pid, *handle_value) {
+        match probe_handle_path_with_timeout(pid, *handle_value, handle_probe_timeout) {
             HandleProbeOutcome::Path(full_name) => {
                 if matchers.matches(&full_name) {
                     locked_files.insert(full_name);
@@ -332,7 +330,7 @@ fn scan_process_handles(
                 LockScanWarningKind::HandleEnumeration,
                 format!(
                     "handle {handle_value:#x} did not finish within {}ms",
-                    HANDLE_PROBE_TIMEOUT.as_millis()
+                    handle_probe_timeout.as_millis()
                 ),
             )),
             HandleProbeOutcome::WorkerLimitReached => warnings.push(LockScanWarning::new(
@@ -428,9 +426,152 @@ fn debug_privilege_error(err: WholockError) -> WholockError {
     ))
 }
 
+fn debug_privilege_warning(err: WholockError) -> LockScanWarning {
+    LockScanWarning::new(
+        None,
+        LockScanWarningKind::DebugPrivilege,
+        format!("Failed to enable SeDebugPrivilege before scanning locks: {err}"),
+    )
+}
+
+fn handle_debug_privilege_result(
+    result: WholockResult<()>,
+    require_debug_privilege: bool,
+    warnings: &mut Vec<LockScanWarning>,
+) -> WholockResult<()> {
+    if let Err(err) = result {
+        if require_debug_privilege {
+            return Err(debug_privilege_error(err));
+        }
+        warnings.push(debug_privilege_warning(err));
+    }
+
+    Ok(())
+}
+
+fn handle_table_warning(err: WholockError) -> LockScanWarning {
+    LockScanWarning::new(
+        None,
+        LockScanWarningKind::HandleEnumeration,
+        format!("failed to query system handle table: {err}"),
+    )
+}
+
+/// Scans files and directories for matching lock holders.
+///
+/// This is the primary scan API. It follows PowerToys File Locksmith's default
+/// behavior when [`LockScanOptions::require_debug_privilege`] is `false`: wholock
+/// attempts to enable debug privilege to improve visibility, records a warning if
+/// that fails, and continues scanning processes that are still accessible.
+///
+/// Directory inputs are matched recursively, so files and loaded modules underneath a
+/// requested directory are included in the result. Empty, malformed, inaccessible, or
+/// missing paths return [`WholockError::PathError`].
+///
+/// # Arguments
+///
+/// * `paths` - The file and directory paths to scan recursively
+/// * `options` - Scan behavior such as privilege strictness and handle timeout
+///
+/// # Returns
+///
+/// Returns [`LockScanResult`] with discovered processes and recoverable scan warnings.
+/// Use [`LockScanResult::is_complete`] to check whether any warnings occurred.
+///
+/// # Errors
+///
+/// Returns a `WholockError` if path validation fails, or if debug privilege setup fails
+/// while [`LockScanOptions::require_debug_privilege`] is enabled.
+///
+/// # Examples
+///
+/// ```no_run
+/// use wholock::{LockScanOptions, scan_locks};
+///
+/// let scan = scan_locks(["C:\\work", "C:\\data\\locked.txt"], LockScanOptions::default())?;
+///
+/// for process in &scan.processes {
+///     println!("PID {}: {}", process.pid, process.process_name);
+/// }
+/// # Ok::<(), wholock::error::WholockError>(())
+/// ```
+pub fn scan_locks<I, P>(paths: I, options: LockScanOptions) -> WholockResult<LockScanResult>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<str>,
+{
+    let matchers = LockedPathMatchers::new(paths)?;
+    if matchers.is_empty() {
+        return Ok(LockScanResult::new(Vec::new(), Vec::new()));
+    }
+
+    let mut warnings = Vec::new();
+    handle_debug_privilege_result(
+        enable_debug_privilege(),
+        options.require_debug_privilege,
+        &mut warnings,
+    )?;
+
+    let mut result: BTreeMap<u32, ProcessLockCollector> = BTreeMap::new();
+    let matchers = Arc::new(matchers);
+
+    match query_system_information_buffer(SYSTEM_EXTENDED_HANDLE_INFORMATION) {
+        Ok(buffer) => match get_handle_table(&buffer) {
+            Ok(table) => {
+                let handle_groups = table
+                    .iter()
+                    .filter_map(|handle| {
+                        let pid = u32::try_from(handle.unique_process_id()).ok()?;
+                        Some((pid, handle.handle_value_raw()))
+                    })
+                    .into_group_map();
+
+                let (handle_results, handle_warnings) = collect_handle_locks_parallel(
+                    handle_groups.into_iter().collect(),
+                    Arc::clone(&matchers),
+                    options.handle_probe_timeout,
+                );
+                result.extend(handle_results);
+                warnings.extend(handle_warnings);
+            }
+            Err(err) => warnings.push(handle_table_warning(err)),
+        },
+        Err(err) => warnings.push(handle_table_warning(err)),
+    }
+
+    if options.include_modules {
+        let system = sysinfo::System::new_all();
+        for pid in system
+            .processes()
+            .keys()
+            .map(|pid| usize::from(*pid) as u32)
+        {
+            let module_paths = match get_process_module_paths(pid) {
+                Ok(module_paths) => module_paths,
+                Err(err) => {
+                    warnings.push(module_scan_warning(pid, err));
+                    continue;
+                }
+            };
+
+            for module_path in module_paths {
+                if matchers.matches(&module_path) {
+                    result
+                        .entry(pid)
+                        .or_insert_with(|| ProcessLockCollector::new(pid))
+                        .insert_path(module_path);
+                }
+            }
+        }
+    }
+
+    Ok(finish_lock_scan(result, warnings))
+}
+
 /// Identifies all processes that have locked a specified file.
 ///
-/// This is a compatibility wrapper around [`find_processes_recursive`].
+/// This is a convenience wrapper around [`find_processes_recursive`] using
+/// [`LockScanOptions::default`].
 ///
 /// # Arguments
 ///
@@ -438,30 +579,29 @@ fn debug_privilege_error(err: WholockError) -> WholockError {
 ///
 /// # Returns
 ///
-/// Returns `WholockResult<Vec<ProcessInfo>>` containing information about all processes
-/// that have locked the file. Each `ProcessInfo` includes process ID, name, executable path,
-/// user information, and a list of locked file paths.
+/// Returns `WholockResult<LockScanResult>` containing discovered processes and any
+/// recoverable warnings observed while scanning.
 ///
 /// # Errors
 ///
-/// Returns a `WholockError` if system handle information cannot be queried or if other
-/// errors occur during processing.
+/// Returns a `WholockError` if the path is invalid or other hard errors occur during
+/// processing. Recoverable scan failures are returned as warnings in the result.
 ///
 /// # Examples
 ///
 /// ```no_run
-/// use wholock::{who_locks_file, ProcessInfo};
+/// use wholock::who_locks_file;
 ///
 /// match who_locks_file("C:\\path\\to\\file.txt") {
-///     Ok(processes) => {
-///         for process in processes {
+///     Ok(scan) => {
+///         for process in scan.processes {
 ///             println!("Process {} ({}) has locked the file", process.process_name, process.pid);
 ///         }
 ///     },
 ///     Err(e) => println!("Error occurred: {:?}", e),
 /// }
 /// ```
-pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
+pub fn who_locks_file(path: &str) -> WholockResult<LockScanResult> {
     find_processes_recursive(std::iter::once(path))
 }
 
@@ -477,30 +617,29 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
 ///
 /// # Returns
 ///
-/// Returns `WholockResult<Vec<ProcessInfo>>` containing every process that matched at
-/// least one requested path.
+/// Returns `WholockResult<LockScanResult>` containing every process that matched at
+/// least one requested path plus recoverable scan warnings.
 ///
 /// # Errors
 ///
-/// Returns a `WholockError` if any path is invalid, if system handle information cannot
-/// be queried, or if scanning only produced a partial result with warnings.
+/// Returns a `WholockError` if any path is invalid or another hard error occurs.
 ///
 /// # Examples
 ///
 /// ```no_run
 /// use wholock::who_locks_files;
 ///
-/// let processes = who_locks_files([
+/// let scan = who_locks_files([
 ///     "C:\\path\\to\\file.txt",
 ///     "C:\\path\\to\\directory",
 /// ])?;
 ///
-/// for process in processes {
+/// for process in scan.processes {
 ///     println!("{} locks {:?}", process.process_name, process.locked_file);
 /// }
 /// # Ok::<(), wholock::error::WholockError>(())
 /// ```
-pub fn who_locks_files<I, P>(paths: I) -> WholockResult<Vec<ProcessInfo>>
+pub fn who_locks_files<I, P>(paths: I) -> WholockResult<LockScanResult>
 where
     I: IntoIterator<Item = P>,
     P: AsRef<str>,
@@ -521,82 +660,32 @@ where
 ///
 /// # Returns
 ///
-/// Returns `WholockResult<Vec<ProcessInfo>>` containing information about all matching
-/// lock holders. Directory inputs match files and loaded modules below that directory.
+/// Returns `WholockResult<LockScanResult>` containing information about all matching
+/// lock holders and recoverable warnings. Directory inputs match files and loaded
+/// modules below that directory.
 ///
 /// # Errors
 ///
-/// Returns a `WholockError` if path validation fails, if debug privilege setup fails,
-/// if the system handle table cannot be queried, or if the scan result is partial.
+/// Returns a `WholockError` if path validation fails or another hard error occurs.
 ///
 /// # Examples
 ///
 /// ```no_run
 /// use wholock::find_processes_recursive;
 ///
-/// let processes = find_processes_recursive(vec!["C:\\work", "C:\\data\\locked.txt"])?;
+/// let scan = find_processes_recursive(vec!["C:\\work", "C:\\data\\locked.txt"])?;
 ///
-/// for process in processes {
+/// for process in scan.processes {
 ///     println!("PID {}: {}", process.pid, process.process_name);
 /// }
 /// # Ok::<(), wholock::error::WholockError>(())
 /// ```
-pub fn find_processes_recursive<I, P>(paths: I) -> WholockResult<Vec<ProcessInfo>>
+pub fn find_processes_recursive<I, P>(paths: I) -> WholockResult<LockScanResult>
 where
     I: IntoIterator<Item = P>,
     P: AsRef<str>,
 {
-    let matchers = LockedPathMatchers::new(paths)?;
-    if matchers.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    enable_debug_privilege().map_err(debug_privilege_error)?;
-
-    let mut result: BTreeMap<u32, ProcessLockCollector> = BTreeMap::new();
-    let mut warnings = Vec::new();
-    let matchers = Arc::new(matchers);
-
-    let buffer = query_system_information_buffer(SYSTEM_EXTENDED_HANDLE_INFORMATION)?;
-    let table = get_handle_table(&buffer)?;
-    let handle_groups = table
-        .iter()
-        .filter_map(|handle| {
-            let pid = u32::try_from(handle.unique_process_id()).ok()?;
-            Some((pid, handle.handle_value_raw()))
-        })
-        .into_group_map();
-
-    let (handle_results, handle_warnings) =
-        collect_handle_locks_parallel(handle_groups.into_iter().collect(), Arc::clone(&matchers));
-    result.extend(handle_results);
-    warnings.extend(handle_warnings);
-
-    let system = sysinfo::System::new_all();
-    for pid in system
-        .processes()
-        .keys()
-        .map(|pid| usize::from(*pid) as u32)
-    {
-        let module_paths = match get_process_module_paths(pid) {
-            Ok(module_paths) => module_paths,
-            Err(err) => {
-                warnings.push(module_scan_warning(pid, err));
-                continue;
-            }
-        };
-
-        for module_path in module_paths {
-            if matchers.matches(&module_path) {
-                result
-                    .entry(pid)
-                    .or_insert_with(|| ProcessLockCollector::new(pid))
-                    .insert_path(module_path);
-            }
-        }
-    }
-
-    finish_lock_scan(result, warnings)
+    scan_locks(paths, LockScanOptions::default())
 }
 
 #[cfg(test)]
@@ -606,17 +695,10 @@ mod tests {
     use std::io::Write;
     use tempfile::tempdir;
 
-    fn scan_or_skip_for_missing_debug_privilege(path: &str) -> Option<Vec<ProcessInfo>> {
-        match who_locks_file(path) {
-            Ok(processes) => Some(processes),
-            Err(WholockError::PermissionError(message))
-                if message.message().contains("SeDebugPrivilege") =>
-            {
-                eprintln!("skipping real lock scan test: {message}");
-                None
-            }
-            Err(err) => panic!("lock scan failed: {err:?}"),
-        }
+    fn scan_processes(path: &str) -> Vec<ProcessInfo> {
+        who_locks_file(path)
+            .unwrap_or_else(|err| panic!("lock scan failed: {err:?}"))
+            .processes
     }
 
     #[test]
@@ -654,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn test_finish_lock_scan_returns_partial_error_with_warnings() {
+    fn test_finish_lock_scan_returns_result_with_warnings() {
         let warning = LockScanWarning::new(
             Some(42),
             LockScanWarningKind::HandleEnumeration,
@@ -662,13 +744,9 @@ mod tests {
         );
         let result = finish_lock_scan(BTreeMap::new(), vec![warning]);
 
-        assert!(matches!(
-            result,
-            Err(WholockError::PartialLockScan {
-                processes,
-                warnings,
-            }) if processes.is_empty() && warnings.len() == 1
-        ));
+        assert!(result.processes.is_empty());
+        assert_eq!(result.warnings.len(), 1);
+        assert!(!result.is_complete());
     }
 
     #[test]
@@ -719,16 +797,51 @@ mod tests {
     }
 
     #[test]
+    fn test_debug_privilege_warning_allows_best_effort_scan() {
+        let mut warnings = Vec::new();
+        let result = handle_debug_privilege_result(
+            Err(WholockError::permission("SeDebugPrivilege is not assigned")),
+            false,
+            &mut warnings,
+        );
+
+        assert!(result.is_ok());
+        assert!(matches!(
+            warnings.first().map(|warning| warning.kind),
+            Some(LockScanWarningKind::DebugPrivilege)
+        ));
+    }
+
+    #[test]
+    fn test_required_debug_privilege_fails_fast() {
+        let mut warnings = Vec::new();
+        let result = handle_debug_privilege_result(
+            Err(WholockError::permission("SeDebugPrivilege is not assigned")),
+            true,
+            &mut warnings,
+        );
+
+        assert!(matches!(result, Err(WholockError::PermissionError(_))));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_handle_table_warning_is_recoverable_warning() {
+        let warning = handle_table_warning(WholockError::system_info("buffer too small"));
+
+        assert_eq!(warning.pid, None);
+        assert_eq!(warning.kind, LockScanWarningKind::HandleEnumeration);
+        assert!(warning.message.contains("buffer too small"));
+    }
+
+    #[test]
     fn test_who_locks_file() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("locked.txt");
         let mut file = File::create(&file_path).unwrap();
         writeln!(file, "test content").unwrap();
 
-        let Some(processes) = scan_or_skip_for_missing_debug_privilege(file_path.to_str().unwrap())
-        else {
-            return;
-        };
+        let processes = scan_processes(file_path.to_str().unwrap());
         assert!(!processes.is_empty());
 
         let current_process = processes

@@ -155,10 +155,22 @@ fn process_still_holds_snapshot_locks(
         })?;
 
     if current_locks
+        .processes
         .iter()
         .any(|current| current.pid == process.pid && !current.locked_file.is_empty())
     {
         return Ok(());
+    }
+
+    if !current_locks.warnings.is_empty() {
+        return Err(ProcessTerminationFailure {
+            pid: process.pid,
+            kind: ProcessTerminationFailureKind::LockVerification,
+            reason: format!(
+                "lock query did not report this PID, but scan was incomplete with {} warning(s)",
+                current_locks.warnings.len()
+            ),
+        });
     }
 
     Err(ProcessTerminationFailure {
@@ -247,10 +259,10 @@ fn terminate_process_by_pid(pid: u32) -> WholockResult<()> {
 /// use wholock::{who_locks_file, unlock_file};
 ///
 /// // Find processes locking a file
-/// let processes = who_locks_file("C:\\path\\to\\file.txt").unwrap();
+/// let scan = who_locks_file("C:\\path\\to\\file.txt").unwrap();
 ///
 /// // Terminate the first process found
-/// if let Some(process) = processes.first() {
+/// if let Some(process) = scan.processes.first() {
 ///     match unlock_file(process.pid) {
 ///         Ok(_) => println!("Successfully terminated process {}", process.pid),
 ///         Err(e) => println!("Failed to terminate process: {:?}", e),
@@ -288,8 +300,8 @@ pub fn unlock_file(pid: u32) -> WholockResult<()> {
 /// ```no_run
 /// use wholock::{unlock_processes, who_locks_file};
 ///
-/// let processes = who_locks_file("C:\\path\\to\\file.txt")?;
-/// let results = unlock_processes(&processes);
+/// let scan = who_locks_file("C:\\path\\to\\file.txt")?;
+/// let results = unlock_processes(&scan.processes);
 ///
 /// for result in results {
 ///     if result.is_success() {

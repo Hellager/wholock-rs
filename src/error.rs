@@ -6,6 +6,7 @@ use windows::core::Error as WindowsError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LockScanWarningKind {
+    DebugPrivilege,
     OpenProcess,
     HandleEnumeration,
     ModuleEnumeration,
@@ -14,6 +15,7 @@ pub enum LockScanWarningKind {
 impl fmt::Display for LockScanWarningKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            LockScanWarningKind::DebugPrivilege => f.write_str("debug privilege"),
             LockScanWarningKind::OpenProcess => f.write_str("open process"),
             LockScanWarningKind::HandleEnumeration => f.write_str("handle enumeration"),
             LockScanWarningKind::ModuleEnumeration => f.write_str("module enumeration"),
