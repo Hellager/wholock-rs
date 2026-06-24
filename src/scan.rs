@@ -316,6 +316,36 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
 /// Directory inputs are matched recursively, so files and loaded modules underneath a
 /// requested directory are included in the result. Empty, malformed, inaccessible, or
 /// missing paths return [`WholockError::PathError`].
+///
+/// # Arguments
+///
+/// * `paths` - The file and directory paths to check, each as a string-like value
+///
+/// # Returns
+///
+/// Returns `WholockResult<Vec<ProcessInfo>>` containing every process that matched at
+/// least one requested path.
+///
+/// # Errors
+///
+/// Returns a `WholockError` if any path is invalid, if system handle information cannot
+/// be queried, or if scanning only produced a partial result with warnings.
+///
+/// # Examples
+///
+/// ```no_run
+/// use wholock::who_locks_files;
+///
+/// let processes = who_locks_files([
+///     "C:\\path\\to\\file.txt",
+///     "C:\\path\\to\\directory",
+/// ])?;
+///
+/// for process in processes {
+///     println!("{} locks {:?}", process.process_name, process.locked_file);
+/// }
+/// # Ok::<(), wholock::error::WholockError>(())
+/// ```
 pub fn who_locks_files<I, P>(paths: I) -> WholockResult<Vec<ProcessInfo>>
 where
     I: IntoIterator<Item = P>,
@@ -330,6 +360,33 @@ where
 /// Directory inputs are matched recursively, and all paths are checked during one
 /// system handle/module scan. Empty, malformed, inaccessible, or missing paths
 /// return [`WholockError::PathError`].
+///
+/// # Arguments
+///
+/// * `paths` - The file and directory paths to scan recursively
+///
+/// # Returns
+///
+/// Returns `WholockResult<Vec<ProcessInfo>>` containing information about all matching
+/// lock holders. Directory inputs match files and loaded modules below that directory.
+///
+/// # Errors
+///
+/// Returns a `WholockError` if path validation fails, if debug privilege setup fails,
+/// if the system handle table cannot be queried, or if the scan result is partial.
+///
+/// # Examples
+///
+/// ```no_run
+/// use wholock::find_processes_recursive;
+///
+/// let processes = find_processes_recursive(vec!["C:\\work", "C:\\data\\locked.txt"])?;
+///
+/// for process in processes {
+///     println!("PID {}: {}", process.pid, process.process_name);
+/// }
+/// # Ok::<(), wholock::error::WholockError>(())
+/// ```
 pub fn find_processes_recursive<I, P>(paths: I) -> WholockResult<Vec<ProcessInfo>>
 where
     I: IntoIterator<Item = P>,

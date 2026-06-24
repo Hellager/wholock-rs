@@ -5,6 +5,36 @@ use std::time::{Duration, Instant};
 const WAIT_FOR_UNLOCK_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Waits until a single file or directory no longer has matching locks.
+///
+/// This is a convenience wrapper around [`wait_for_unlock_files`].
+///
+/// # Arguments
+///
+/// * `path` - The file or directory path to wait on
+/// * `timeout` - Maximum duration to wait, or `None` to wait indefinitely
+///
+/// # Returns
+///
+/// Returns `WholockResult<WaitForUnlockResult>` describing whether the path unlocked,
+/// how long polling took, and any remaining locks on timeout.
+///
+/// # Errors
+///
+/// Returns a [`WholockError`](crate::error::WholockError) if the path is invalid or if
+/// a lock scan fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::time::Duration;
+/// use wholock::wait_for_unlock;
+///
+/// let result = wait_for_unlock("C:\\path\\to\\file.txt", Some(Duration::from_secs(5)))?;
+/// if result.timed_out() {
+///     println!("still locked by {} process(es)", result.remaining_locks.len());
+/// }
+/// # Ok::<(), wholock::error::WholockError>(())
+/// ```
 pub fn wait_for_unlock(
     path: &str,
     timeout: Option<Duration>,
@@ -16,6 +46,36 @@ pub fn wait_for_unlock(
 ///
 /// The query is retried every 200ms. If `timeout` is `None`, this waits
 /// indefinitely.
+///
+/// # Arguments
+///
+/// * `paths` - The file and directory paths to wait on
+/// * `timeout` - Maximum duration to wait, or `None` to wait indefinitely
+///
+/// # Returns
+///
+/// Returns `WholockResult<WaitForUnlockResult>` with `unlocked` set to `true` when no
+/// matching locks remain.
+///
+/// # Errors
+///
+/// Returns a [`WholockError`](crate::error::WholockError) if any path is invalid or if
+/// a lock scan fails while polling.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::time::Duration;
+/// use wholock::wait_for_unlock_files;
+///
+/// let result = wait_for_unlock_files(
+///     ["C:\\path\\to\\file.txt", "C:\\path\\to\\directory"],
+///     Some(Duration::from_secs(10)),
+/// )?;
+///
+/// assert!(result.unlocked || result.timed_out());
+/// # Ok::<(), wholock::error::WholockError>(())
+/// ```
 pub fn wait_for_unlock_files<I, P>(
     paths: I,
     timeout: Option<Duration>,

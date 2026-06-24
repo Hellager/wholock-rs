@@ -31,6 +31,36 @@ fn json_process_list(processes: &[ProcessInfo]) -> JsonProcessList<'_> {
 /// Serializes process lock results as PowerToys-compatible JSON.
 ///
 /// The output shape is `{ "processes": [{ "pid", "name", "user", "files" }] }`.
+///
+/// # Arguments
+///
+/// * `processes` - Process lock results to serialize
+///
+/// # Returns
+///
+/// Returns `WholockResult<String>` containing the JSON representation.
+///
+/// # Errors
+///
+/// Returns a [`WholockError`](crate::error::WholockError) if serialization fails.
+///
+/// # Examples
+///
+/// ```
+/// use wholock::{ProcessInfo, processes_to_json};
+///
+/// let processes = vec![ProcessInfo {
+///     pid: 42,
+///     process_name: "locker.exe".to_string(),
+///     process_exe_path: "C:\\tools\\locker.exe".to_string(),
+///     domain_username: "DOMAIN\\user".to_string(),
+///     locked_file: vec!["C:\\data\\locked.txt".to_string()],
+/// }];
+///
+/// let json = processes_to_json(&processes)?;
+/// assert!(json.contains("locker.exe"));
+/// # Ok::<(), wholock::error::WholockError>(())
+/// ```
 pub fn processes_to_json(processes: &[ProcessInfo]) -> WholockResult<String> {
     serde_json::to_string(&json_process_list(processes))
         .map_err(|err| WholockError::other(format!("Failed to serialize JSON output: {err}")))

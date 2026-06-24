@@ -9,6 +9,9 @@ mod wait;
 
 use crate::error::WholockError;
 
+/// Result type returned by wholock APIs.
+///
+/// This is a crate-wide alias for `Result<T, WholockError>`.
 pub type WholockResult<T> = Result<T, WholockError>;
 
 pub use elevation::{

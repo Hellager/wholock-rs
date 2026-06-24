@@ -219,7 +219,7 @@ fn terminate_process_by_pid(pid: u32) -> WholockResult<()> {
     terminate_process_by_pid_detailed(pid).map_err(|failure| failure.to_wholock_error())
 }
 
-/// Terminates a process to unlock files held by that process
+/// Terminates a process to unlock files held by that process.
 ///
 /// This function forcibly terminates the specified process, which will release
 /// any file locks held by that process. Use with caution as terminating processes
@@ -237,6 +237,7 @@ fn terminate_process_by_pid(pid: u32) -> WholockResult<()> {
 ///
 /// Returns a `WholockError` if:
 /// - The provided PID is invalid or doesn't exist
+/// - The PID identifies the current process or a protected system process
 /// - The process cannot be opened with termination rights
 /// - The process termination fails
 ///
@@ -266,6 +267,39 @@ pub fn unlock_file(pid: u32) -> WholockResult<()> {
 /// result per unique PID. Before termination, this revalidates that the PID still
 /// identifies the same executable and still appears in a fresh lock query for the
 /// recorded locked paths.
+///
+/// # Arguments
+///
+/// * `processes` - Process lock results, usually returned by [`who_locks_file`](crate::who_locks_file)
+///   or [`who_locks_files`](crate::who_locks_files)
+///
+/// # Returns
+///
+/// Returns one [`UnlockProcessResult`] per unique PID. Each item contains the public
+/// `WholockResult<()>` and structured failure details when termination failed.
+///
+/// # Errors
+///
+/// This function does not return a top-level error. Per-process failures are reported
+/// in each [`UnlockProcessResult`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use wholock::{unlock_processes, who_locks_file};
+///
+/// let processes = who_locks_file("C:\\path\\to\\file.txt")?;
+/// let results = unlock_processes(&processes);
+///
+/// for result in results {
+///     if result.is_success() {
+///         println!("terminated {}", result.pid);
+///     } else if let Some(reason) = result.failure_reason() {
+///         println!("failed to terminate {}: {}", result.pid, reason);
+///     }
+/// }
+/// # Ok::<(), wholock::error::WholockError>(())
+/// ```
 pub fn unlock_processes(processes: &[ProcessInfo]) -> Vec<UnlockProcessResult> {
     let mut seen = BTreeSet::new();
     processes

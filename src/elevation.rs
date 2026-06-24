@@ -56,11 +56,52 @@ fn quote_windows_arg(arg: &OsStr) -> String {
 }
 
 /// Returns whether the current process is running with an elevated token.
+///
+/// # Returns
+///
+/// Returns `WholockResult<bool>` where `true` means the current process token is elevated.
+///
+/// # Errors
+///
+/// Returns a [`WholockError`](crate::error::WholockError) if the current process token
+/// cannot be opened or queried.
+///
+/// # Examples
+///
+/// ```no_run
+/// use wholock::is_process_elevated;
+///
+/// match is_process_elevated() {
+///     Ok(true) => println!("running elevated"),
+///     Ok(false) => println!("not elevated"),
+///     Err(error) => eprintln!("failed to query elevation: {error}"),
+/// }
+/// ```
 pub fn is_process_elevated() -> WholockResult<bool> {
     current_process_is_elevated()
 }
 
 /// Enables `SeDebugPrivilege` on the current process token when the token has it.
+///
+/// # Returns
+///
+/// Returns `WholockResult<()>` when the privilege was enabled successfully.
+///
+/// # Errors
+///
+/// Returns a [`WholockError`](crate::error::WholockError) if the process token cannot be
+/// opened, if the privilege cannot be looked up, or if the token does not include
+/// `SeDebugPrivilege`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use wholock::enable_debug_privilege;
+///
+/// if let Err(error) = enable_debug_privilege() {
+///     eprintln!("lock scans may be incomplete: {error}");
+/// }
+/// ```
 pub fn enable_debug_privilege() -> WholockResult<()> {
     enable_current_process_debug_privilege()
 }
@@ -68,6 +109,26 @@ pub fn enable_debug_privilege() -> WholockResult<()> {
 /// Starts an elevated copy of the current executable with the same arguments.
 ///
 /// The current process is left running so callers can decide whether and when to exit.
+///
+/// # Returns
+///
+/// Returns `WholockResult<()>` after Windows accepts the elevation request.
+///
+/// # Errors
+///
+/// Returns a [`WholockError`](crate::error::WholockError) if the current executable path
+/// cannot be queried or if `ShellExecuteW` reports an elevation/start failure.
+///
+/// # Examples
+///
+/// ```no_run
+/// use wholock::{is_process_elevated, start_as_elevated};
+///
+/// if !is_process_elevated()? {
+///     start_as_elevated()?;
+/// }
+/// # Ok::<(), wholock::error::WholockError>(())
+/// ```
 pub fn start_as_elevated() -> WholockResult<()> {
     let exe = std::env::current_exe()?;
     let file = wide_null_os(exe.as_os_str());
@@ -108,6 +169,23 @@ pub fn start_as_elevated() -> WholockResult<()> {
 }
 
 /// Alias for [`start_as_elevated`].
+///
+/// # Returns
+///
+/// Returns the same result as [`start_as_elevated`].
+///
+/// # Errors
+///
+/// Returns the same errors as [`start_as_elevated`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use wholock::restart_as_elevated;
+///
+/// restart_as_elevated()?;
+/// # Ok::<(), wholock::error::WholockError>(())
+/// ```
 pub fn restart_as_elevated() -> WholockResult<()> {
     start_as_elevated()
 }
