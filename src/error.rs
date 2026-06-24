@@ -2,6 +2,42 @@ use std::fmt;
 use windows::core::Error as WindowsError;
 use windows::Win32::Foundation::WIN32_ERROR;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockScanWarningKind {
+    OpenProcess,
+    ModuleEnumeration,
+}
+
+impl fmt::Display for LockScanWarningKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LockScanWarningKind::OpenProcess => f.write_str("open process"),
+            LockScanWarningKind::ModuleEnumeration => f.write_str("module enumeration"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockScanWarning {
+    pub pid: Option<u32>,
+    pub kind: LockScanWarningKind,
+    pub message: String,
+}
+
+impl LockScanWarning {
+    pub(crate) fn new(
+        pid: Option<u32>,
+        kind: LockScanWarningKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            pid,
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum WholockError {
     WindowsError(WindowsError),
@@ -14,6 +50,10 @@ pub enum WholockError {
     ProcessError(String),
     PermissionError(String),
     InvalidPID(u32),
+    PartialLockScan {
+        processes: Vec<crate::ProcessInfo>,
+        warnings: Vec<LockScanWarning>,
+    },
     Other(String),
 }
 
@@ -37,6 +77,25 @@ impl fmt::Display for WholockError {
             WholockError::ProcessError(e) => write!(f, "Process error: {}", e),
             WholockError::PermissionError(e) => write!(f, "Permission error: {}", e),
             WholockError::InvalidPID(e) => write!(f, "Invalid PID: {}", e),
+            WholockError::PartialLockScan {
+                processes,
+                warnings,
+            } => {
+                write!(
+                    f,
+                    "Partial lock scan: found {} process(es), but {} scan warning(s) occurred",
+                    processes.len(),
+                    warnings.len()
+                )?;
+                if let Some(warning) = warnings.first() {
+                    write!(f, "; first warning: ")?;
+                    if let Some(pid) = warning.pid {
+                        write!(f, "PID {pid} ")?;
+                    }
+                    write!(f, "{} failed: {}", warning.kind, warning.message)?;
+                }
+                Ok(())
+            }
             WholockError::Other(e) => write!(f, "{}", e),
         }
     }

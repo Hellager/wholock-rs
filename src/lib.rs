@@ -1,7 +1,7 @@
 pub mod error;
 mod interop;
 
-use crate::error::WholockError;
+use crate::error::{LockScanWarning, LockScanWarningKind, WholockError};
 use crate::interop::{
     duplicate_handle_value, enable_debug_privilege as enable_current_process_debug_privilege,
     get_final_path_name_by_handle, get_handle_owner_info, get_handle_table, get_process_info,
@@ -335,9 +335,9 @@ fn handle_scan_worker_count(task_count: usize) -> usize {
 fn collect_handle_locks_parallel(
     handle_groups: Vec<(u32, Vec<usize>)>,
     matchers: Arc<LockedPathMatchers>,
-) -> BTreeMap<u32, ProcessLockCollector> {
+) -> (BTreeMap<u32, ProcessLockCollector>, Vec<LockScanWarning>) {
     if handle_groups.is_empty() {
-        return BTreeMap::new();
+        return (BTreeMap::new(), Vec::new());
     }
 
     let worker_count = handle_scan_worker_count(handle_groups.len());
@@ -355,31 +355,81 @@ fn collect_handle_locks_parallel(
                 break;
             };
 
-            if let Some(process_info) = scan_process_handles(pid, &handle_values, &matchers) {
-                let _ = tx.send(process_info);
-            }
+            let scan_result = scan_process_handles(pid, &handle_values, &matchers);
+            let _ = tx.send(scan_result);
         }));
     }
 
     drop(tx);
 
     let mut result = BTreeMap::new();
-    for process_info in rx {
-        result.insert(process_info.pid, process_info);
+    let mut warnings = Vec::new();
+    for process_scan in rx {
+        if let Some(process_info) = process_scan.process_info {
+            result.insert(process_info.pid, process_info);
+        }
+        warnings.extend(process_scan.warnings);
     }
 
     for worker in workers {
         let _ = worker.join();
     }
 
-    result
+    (result, warnings)
+}
+
+struct ProcessHandleScanResult {
+    process_info: Option<ProcessLockCollector>,
+    warnings: Vec<LockScanWarning>,
+}
+
+impl ProcessHandleScanResult {
+    fn warning(pid: u32, kind: LockScanWarningKind, message: impl Into<String>) -> Self {
+        Self {
+            process_info: None,
+            warnings: vec![LockScanWarning::new(Some(pid), kind, message)],
+        }
+    }
+
+    fn with_process_info(
+        process_info: ProcessLockCollector,
+        warnings: Vec<LockScanWarning>,
+    ) -> Self {
+        Self {
+            process_info: Some(process_info),
+            warnings,
+        }
+    }
+}
+
+fn partial_scan_error(processes: Vec<ProcessInfo>, warnings: Vec<LockScanWarning>) -> WholockError {
+    WholockError::PartialLockScan {
+        processes,
+        warnings,
+    }
+}
+
+fn finish_lock_scan(
+    result: BTreeMap<u32, ProcessLockCollector>,
+    warnings: Vec<LockScanWarning>,
+) -> WholockResult<Vec<ProcessInfo>> {
+    let processes = result
+        .into_values()
+        .map(ProcessLockCollector::into_process_info)
+        .collect::<Vec<_>>();
+
+    if warnings.is_empty() {
+        Ok(processes)
+    } else {
+        Err(partial_scan_error(processes, warnings))
+    }
 }
 
 fn scan_process_handles(
     pid: u32,
     handle_values: &[usize],
     matchers: &LockedPathMatchers,
-) -> Option<ProcessLockCollector> {
+) -> ProcessHandleScanResult {
     let Ok(open_process) = (unsafe {
         OpenProcess(
             PROCESS_ACCESS_RIGHTS_DUP_HANDLE | PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
@@ -387,22 +437,31 @@ fn scan_process_handles(
             pid,
         )
     }) else {
-        return None;
+        return ProcessHandleScanResult::warning(
+            pid,
+            LockScanWarningKind::OpenProcess,
+            "failed to open process for handle duplication",
+        );
     };
     let open_process = HandleWrapper::new(open_process);
     if open_process.is_invalid() {
-        return None;
+        return ProcessHandleScanResult::warning(
+            pid,
+            LockScanWarningKind::OpenProcess,
+            "OpenProcess returned an invalid handle",
+        );
     }
 
     let current_process: windows::Win32::Foundation::HANDLE = unsafe { GetCurrentProcess() };
     let mut locked_files = BTreeSet::new();
+    let warnings = Vec::new();
 
     for handle_value in handle_values {
-        let Ok(dup_handle) =
-            duplicate_handle_value(current_process, open_process.get(), *handle_value)
-        else {
-            continue;
-        };
+        let dup_handle =
+            match duplicate_handle_value(current_process, open_process.get(), *handle_value) {
+                Ok(handle) => handle,
+                Err(_) => continue,
+            };
         let dup_handle = HandleWrapper::new(dup_handle);
         if dup_handle.is_invalid() {
             continue;
@@ -420,14 +479,30 @@ fn scan_process_handles(
     }
 
     if locked_files.is_empty() {
-        return None;
+        return ProcessHandleScanResult {
+            process_info: None,
+            warnings,
+        };
     }
 
     let domain_username = get_handle_owner_info(open_process.get()).ok();
-    Some(ProcessLockCollector::with_locked_files(
-        pid,
-        domain_username,
-        locked_files,
+    ProcessHandleScanResult::with_process_info(
+        ProcessLockCollector::with_locked_files(pid, domain_username, locked_files),
+        warnings,
+    )
+}
+
+fn module_scan_warning(pid: u32, err: WholockError) -> LockScanWarning {
+    LockScanWarning::new(
+        Some(pid),
+        LockScanWarningKind::ModuleEnumeration,
+        err.to_string(),
+    )
+}
+
+fn debug_privilege_error(err: WholockError) -> WholockError {
+    WholockError::PermissionError(format!(
+        "Failed to enable SeDebugPrivilege before scanning locks: {err}"
     ))
 }
 
@@ -496,9 +571,10 @@ where
         return Ok(Vec::new());
     }
 
-    let _ = enable_debug_privilege();
+    enable_debug_privilege().map_err(debug_privilege_error)?;
 
     let mut result: BTreeMap<u32, ProcessLockCollector> = BTreeMap::new();
+    let mut warnings = Vec::new();
     let matchers = Arc::new(matchers);
 
     let buffer = query_system_information_buffer(SYSTEM_EXTENDED_HANDLE_INFORMATION)?;
@@ -511,10 +587,10 @@ where
         })
         .into_group_map();
 
-    result.extend(collect_handle_locks_parallel(
-        handle_groups.into_iter().collect(),
-        Arc::clone(&matchers),
-    ));
+    let (handle_results, handle_warnings) =
+        collect_handle_locks_parallel(handle_groups.into_iter().collect(), Arc::clone(&matchers));
+    result.extend(handle_results);
+    warnings.extend(handle_warnings);
 
     let system = sysinfo::System::new_all();
     for pid in system
@@ -522,22 +598,25 @@ where
         .keys()
         .map(|pid| usize::from(*pid) as u32)
     {
-        if let Ok(module_paths) = get_process_module_paths(pid) {
-            for module_path in module_paths {
-                if matchers.matches(&module_path) {
-                    result
-                        .entry(pid)
-                        .or_insert_with(|| ProcessLockCollector::new(pid))
-                        .insert_path(module_path);
-                }
+        let module_paths = match get_process_module_paths(pid) {
+            Ok(module_paths) => module_paths,
+            Err(err) => {
+                warnings.push(module_scan_warning(pid, err));
+                continue;
+            }
+        };
+
+        for module_path in module_paths {
+            if matchers.matches(&module_path) {
+                result
+                    .entry(pid)
+                    .or_insert_with(|| ProcessLockCollector::new(pid))
+                    .insert_path(module_path);
             }
         }
     }
 
-    Ok(result
-        .into_values()
-        .map(ProcessLockCollector::into_process_info)
-        .collect())
+    finish_lock_scan(result, warnings)
 }
 
 const WAIT_FOR_UNLOCK_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -917,6 +996,52 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(find_processes_recursive(paths).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_finish_lock_scan_returns_partial_error_with_warnings() {
+        let warning = LockScanWarning::new(
+            Some(42),
+            LockScanWarningKind::OpenProcess,
+            "access is denied",
+        );
+        let result = finish_lock_scan(BTreeMap::new(), vec![warning]);
+
+        assert!(matches!(
+            result,
+            Err(WholockError::PartialLockScan {
+                processes,
+                warnings,
+            }) if processes.is_empty() && warnings.len() == 1
+        ));
+    }
+
+    #[test]
+    fn test_partial_lock_scan_display_mentions_warning() {
+        let error = WholockError::PartialLockScan {
+            processes: Vec::new(),
+            warnings: vec![LockScanWarning::new(
+                Some(42),
+                LockScanWarningKind::ModuleEnumeration,
+                "access is denied",
+            )],
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("Partial lock scan"));
+        assert!(message.contains("PID 42"));
+        assert!(message.contains("module enumeration"));
+    }
+
+    #[test]
+    fn test_debug_privilege_error_maps_to_permission_error() {
+        let error = debug_privilege_error(WholockError::PermissionError(
+            "SeDebugPrivilege is not assigned".to_string(),
+        ));
+
+        assert!(
+            matches!(error, WholockError::PermissionError(message) if message.contains("SeDebugPrivilege"))
+        );
     }
 
     #[test]

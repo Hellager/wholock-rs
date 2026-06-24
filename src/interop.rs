@@ -730,18 +730,18 @@ pub(crate) fn get_process_module_paths(pid: u32) -> WholockResult<Vec<String>> {
         let handle = match OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) {
             Ok(handle) => handle,
             Err(e) => {
-                log::warn!(
+                return Err(WholockError::ProcessError(format!(
                     "Failed to open process {} for module enumeration: {}",
                     pid,
                     get_win32_error_message(&WIN32_ERROR(e.code().0 as u32))
-                );
-                return Ok(Vec::new());
+                )));
             }
         };
-        let Ok(safe_handle) = SafeHandle::new(handle) else {
-            log::warn!("Failed to open process {pid} for module enumeration: invalid handle");
-            return Ok(Vec::new());
-        };
+        let safe_handle = SafeHandle::new(handle).map_err(|err| {
+            WholockError::ProcessError(format!(
+                "Failed to open process {pid} for module enumeration: {err}"
+            ))
+        })?;
 
         let mut modules = vec![HMODULE::default(); INITIAL_MODULE_CAPACITY];
 
@@ -756,12 +756,11 @@ pub(crate) fn get_process_module_paths(pid: u32) -> WholockResult<Vec<String>> {
                 buffer_bytes,
                 &mut needed,
             ) {
-                log::warn!(
+                return Err(WholockError::ProcessError(format!(
                     "EnumProcessModules failed for PID {}: {}",
                     pid,
                     get_win32_error_message(&WIN32_ERROR(e.code().0 as u32))
-                );
-                return Ok(Vec::new());
+                )));
             }
 
             let needed_count = module_count_from_needed_bytes(needed);
@@ -1120,9 +1119,9 @@ mod tests {
     }
 
     #[test_log::test]
-    fn test_missing_process_modules_returns_empty() {
-        let modules = get_process_module_paths(u32::MAX).unwrap();
+    fn test_missing_process_modules_returns_error() {
+        let result = get_process_module_paths(u32::MAX);
 
-        assert!(modules.is_empty());
+        assert!(matches!(result, Err(WholockError::ProcessError(_))));
     }
 }
