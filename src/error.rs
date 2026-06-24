@@ -198,6 +198,9 @@ pub(crate) fn get_win32_error_message(error: &WIN32_ERROR) -> String {
     use windows::Win32::System::Diagnostics::Debug::{FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM};
 
     let mut buffer = [0u16; 512];
+    // SAFETY: `buffer` is a valid writable UTF-16 buffer and its length is
+    // passed accurately. FormatMessageW writes at most that length and returns
+    // the initialized character count used below.
     unsafe {
         let size = FormatMessageW(
             FORMAT_MESSAGE_FROM_SYSTEM,

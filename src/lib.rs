@@ -176,6 +176,8 @@ impl HandleWrapper {
 impl Drop for HandleWrapper {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
+            // SAFETY: `HandleWrapper` owns this handle and only calls CloseHandle
+            // once from Drop after confirming it is not an invalid handle value.
             unsafe {
                 let _ = CloseHandle(self.0);
             }
@@ -256,6 +258,9 @@ pub fn start_as_elevated() -> WholockResult<()> {
         .as_ref()
         .map_or(PCWSTR::null(), |value| PCWSTR(value.as_ptr()));
 
+    // SAFETY: `operation`, `file`, and `parameters` are null-terminated UTF-16
+    // buffers that live until ShellExecuteW returns. HWND and directory are null
+    // because no owner window or working directory override is required.
     let result = unsafe {
         ShellExecuteW(
             HWND::default(),
@@ -430,6 +435,9 @@ fn scan_process_handles(
     handle_values: &[usize],
     matchers: &LockedPathMatchers,
 ) -> ProcessHandleScanResult {
+    // SAFETY: OpenProcess is called with a concrete PID from the system handle
+    // table. It returns an owned process HANDLE on success, which is immediately
+    // wrapped in `HandleWrapper` for cleanup.
     let Ok(open_process) = (unsafe {
         OpenProcess(
             PROCESS_ACCESS_RIGHTS_DUP_HANDLE | PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
@@ -452,6 +460,8 @@ fn scan_process_handles(
         );
     }
 
+    // SAFETY: GetCurrentProcess returns the documented pseudo-handle for the
+    // current process. It must not be closed and is only passed to DuplicateHandle.
     let current_process: windows::Win32::Foundation::HANDLE = unsafe { GetCurrentProcess() };
     let mut locked_files = BTreeSet::new();
     let warnings = Vec::new();
@@ -840,6 +850,9 @@ fn process_still_holds_snapshot_locks(
 fn terminate_checked_process(pid: u32) -> Result<(), ProcessTerminationFailure> {
     use windows::Win32::System::Threading::PROCESS_TERMINATE;
 
+    // SAFETY: `pid` has passed the safety checks above. OpenProcess returns an
+    // owned process HANDLE on success, wrapped by `HandleWrapper`; TerminateProcess
+    // is called only with that live handle.
     unsafe {
         let process_handle = OpenProcess(PROCESS_TERMINATE, false, pid).map_err(|err| {
             ProcessTerminationFailure {

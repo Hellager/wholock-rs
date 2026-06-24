@@ -114,6 +114,9 @@ pub(crate) fn query_system_information_buffer(
     let mut buffer: Vec<u8> = vec![];
     loop {
         let mut return_length = 0;
+        // SAFETY: `buffer.as_mut_ptr()` is either null for the initial zero-sized
+        // probe or points to `buffer.len()` writable bytes. `return_length` is a
+        // valid out-parameter for NtQuerySystemInformation.
         let result = unsafe {
             NtQuerySystemInformation(
                 information_class,
@@ -142,11 +145,21 @@ pub(crate) fn query_system_information_buffer(
 
 pub(crate) fn get_handle_table(buffer: &[u8]) -> &[HandleEntry] {
     let info_ptr: *const SystemHandleInformationEx = buffer.as_ptr().cast();
+    // SAFETY: `buffer` comes from NtQuerySystemInformation for
+    // SystemExtendedHandleInformation and is large enough to contain the fixed
+    // header. `addr_of!` avoids creating intermediate references to packed or
+    // unaligned fields in the returned byte buffer.
     let table_ptr: *const HandleEntry = unsafe { addr_of!((*info_ptr).handles).cast() };
+    // SAFETY: Same buffer contract as above; read_unaligned is used because the
+    // byte buffer does not provide Rust alignment guarantees for the NT header.
     let len = unsafe { addr_of!((*info_ptr).number_of_handles).read_unaligned() };
+    // SAFETY: `table_ptr` is derived from `buffer.as_ptr()`, so offset_from is
+    // computed between pointers into the same allocation.
     let table_offset = unsafe { table_ptr.cast::<u8>().offset_from(buffer.as_ptr()) };
     let max_len = (buffer.len() - table_offset as usize) / mem::size_of::<HandleEntry>();
     assert!(len <= max_len);
+    // SAFETY: The assertion above verifies the advertised handle count fits in
+    // the returned buffer. `HandleEntry` is repr(transparent) over the NT entry.
     unsafe { slice::from_raw_parts(table_ptr, len) }
 }
 
@@ -221,6 +234,8 @@ fn duplicate_handle_blocking(
     match result {
         Ok(_) => Ok(target_handle),
         Err(_) => {
+            // SAFETY: GetLastError has no preconditions and reads the calling
+            // thread's last-error code immediately after DuplicateHandle failed.
             let err = unsafe { windows::Win32::Foundation::GetLastError() };
             Err(err.into())
         }
@@ -233,6 +248,9 @@ fn unicode_string_to_string(value: &UNICODE_STRING) -> String {
     }
 
     let len = value.Length as usize / mem::size_of::<u16>();
+    // SAFETY: `UNICODE_STRING` is returned by Windows for the lifetime of the
+    // object information buffer. Length is in bytes and has been converted to
+    // u16 code units; null and zero-length buffers were handled above.
     unsafe { OsString::from_wide(slice::from_raw_parts(value.Buffer.0, len)) }
         .to_string_lossy()
         .to_string()
@@ -243,6 +261,8 @@ pub(crate) fn get_object_type_name(handle: HANDLE) -> WholockResult<String> {
 
     loop {
         let mut return_length = 0;
+        // SAFETY: `handle` is supplied by the caller as a live handle. `buffer`
+        // is a writable byte buffer and `return_length` is a valid out-parameter.
         let status = unsafe {
             NtQueryObject(
                 handle,
@@ -254,6 +274,9 @@ pub(crate) fn get_object_type_name(handle: HANDLE) -> WholockResult<String> {
         };
 
         if status.is_ok() {
+            // SAFETY: On success NtQueryObject wrote an OBJECT_TYPE_INFORMATION
+            // compatible prefix into `buffer`; we only read the leading
+            // UNICODE_STRING field represented by ObjectTypeInformationPrefix.
             let info = unsafe { &*(buffer.as_ptr() as *const ObjectTypeInformationPrefix) };
             return Ok(unicode_string_to_string(&info.name));
         }
@@ -276,11 +299,15 @@ pub(crate) fn get_final_path_name_by_handle(h_file: &HANDLE) -> WholockResult<St
     let mut buf = vec![0u16; 1024];
 
     loop {
+        // SAFETY: `h_file` is expected to be a live file handle. `buf` is a
+        // writable UTF-16 buffer whose length is passed to the Windows API.
         let result = unsafe {
             GetFinalPathNameByHandleW(*h_file, &mut buf, GETFINALPATHNAMEBYHANDLE_FLAGS(0))
         };
 
         if result == 0 {
+            // SAFETY: GetLastError has no preconditions and is read immediately
+            // after GetFinalPathNameByHandleW reports failure.
             return Err(unsafe { GetLastError() }.into());
         }
 
@@ -323,6 +350,9 @@ fn windows_ignore_case_eq(left: &str, right: &str) -> bool {
 }
 
 fn windows_ignore_case_eq_wide(left: &[u16], right: &[u16]) -> bool {
+    // SAFETY: Both slices are valid UTF-16 buffers for the duration of the call.
+    // CompareStringOrdinal only reads from them and the final argument requests
+    // documented case-insensitive ordinal comparison.
     unsafe { CompareStringOrdinal(left, right, true) == CSTR_EQUAL }
 }
 
@@ -350,6 +380,8 @@ fn wide_null(path: &str) -> Vec<u16> {
 
 fn final_path_for_path(path: &str) -> WholockResult<String> {
     let path_wide = wide_null(path);
+    // SAFETY: `path_wide` is a null-terminated UTF-16 path buffer that lives
+    // until CreateFileW returns. The returned handle is wrapped in SafeHandle.
     let handle = unsafe {
         CreateFileW(
             PCWSTR(path_wide.as_ptr()),
@@ -476,6 +508,9 @@ where
 }
 
 pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
+    // SAFETY: All Win32 calls below receive live handles returned by Windows or
+    // stack/vector buffers sized from prior API probes. Every successful HANDLE
+    // is immediately wrapped in SafeHandle for cleanup before returning.
     unsafe {
         let mut token_handle: HANDLE = HANDLE::default();
         let result = OpenProcessToken(handle, TOKEN_QUERY, &mut token_handle);
@@ -511,6 +546,9 @@ pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
             return Ok(String::new());
         }
 
+        // SAFETY: The TOKEN_USER buffer was filled by GetTokenInformation with
+        // TokenUser and is at least `token_info_len` bytes. TOKEN_USER is the
+        // documented leading layout for that buffer.
         let token_user = &*(token_info.as_ptr() as *const TOKEN_USER);
         let sid = token_user.User.Sid;
 
@@ -563,6 +601,9 @@ pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
 }
 
 pub(crate) fn is_process_elevated() -> WholockResult<bool> {
+    // SAFETY: GetCurrentProcess returns a pseudo-handle used only for
+    // OpenProcessToken. The token handle returned by OpenProcessToken is wrapped
+    // in SafeHandle, and TOKEN_ELEVATION is passed with its exact size.
     unsafe {
         let mut token_handle = HANDLE::default();
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle)
@@ -585,6 +626,9 @@ pub(crate) fn is_process_elevated() -> WholockResult<bool> {
 }
 
 pub(crate) fn enable_debug_privilege() -> WholockResult<()> {
+    // SAFETY: GetCurrentProcess returns a pseudo-handle used only for
+    // OpenProcessToken. The token handle is wrapped in SafeHandle. LUID and
+    // TOKEN_PRIVILEGES are initialized before being passed to the Windows APIs.
     unsafe {
         let mut token_handle = HANDLE::default();
         OpenProcessToken(
@@ -663,6 +707,8 @@ impl SafeHandle {
 impl Drop for SafeHandle {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
+            // SAFETY: SafeHandle owns this handle and Drop is the single cleanup
+            // path. Invalid handles are filtered out before CloseHandle.
             unsafe {
                 if let Err(e) = CloseHandle(self.0) {
                     log::error!(
@@ -691,6 +737,9 @@ fn extract_filename(path: &str) -> WholockResult<String> {
 }
 
 pub(crate) fn get_process_info(pid: u32) -> WholockResult<(String, String)> {
+    // SAFETY: OpenProcess returns an owned process handle for `pid` on success
+    // and that handle is wrapped in SafeHandle. QueryFullProcessImageNameW
+    // writes into `buffer`, whose size is supplied via `size`.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).map_err(|e| {
             WholockError::process(format!(
@@ -726,6 +775,9 @@ fn module_count_from_needed_bytes(needed: u32) -> usize {
 }
 
 pub(crate) fn get_process_module_paths(pid: u32) -> WholockResult<Vec<String>> {
+    // SAFETY: OpenProcess returns an owned process handle for `pid` on success
+    // and SafeHandle closes it. EnumProcessModules and GetModuleFileNameExW are
+    // passed buffers whose byte/element sizes are computed from their lengths.
     unsafe {
         let handle = match OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) {
             Ok(handle) => handle,
@@ -931,6 +983,8 @@ mod tests {
 
     #[test]
     fn test_get_handle_owner_info() {
+        // SAFETY: GetCurrentProcess returns a pseudo-handle for the current
+        // process. The test passes it to get_handle_owner_info and never closes it.
         let current_process = unsafe { GetCurrentProcess() };
         let result = get_handle_owner_info(current_process);
         assert!(result.is_ok());
@@ -995,6 +1049,8 @@ mod tests {
         File::create(&file_path).unwrap();
 
         let file = File::open(&file_path).unwrap();
+        // SAFETY: GetCurrentProcess returns a pseudo-handle for the current
+        // process. The duplicated file handle below is closed explicitly.
         let current_process = unsafe { GetCurrentProcess() };
         let entry = HandleEntry(SystemHandleTableEntryInfoEx {
             object: std::ptr::null_mut(),
@@ -1010,6 +1066,8 @@ mod tests {
         let duplicated = duplicate_handle(current_process, current_process, &entry).unwrap();
         assert!(!duplicated.is_invalid());
 
+        // SAFETY: `duplicated` is an owned handle returned by DuplicateHandle in
+        // this test and has not been closed yet.
         unsafe {
             CloseHandle(duplicated).unwrap();
         }
@@ -1017,6 +1075,8 @@ mod tests {
 
     #[test]
     fn test_non_file_handle_type_detection() {
+        // SAFETY: GetCurrentProcess returns a pseudo-handle that is valid for
+        // type probing and must not be closed.
         let current_process = unsafe { GetCurrentProcess() };
 
         assert!(!is_file_handle(current_process));
@@ -1029,6 +1089,9 @@ mod tests {
         File::create(&file_path).unwrap();
 
         let path_wide = wide_null(file_path.to_str().unwrap());
+        // SAFETY: `path_wide` is a null-terminated UTF-16 buffer that lives
+        // until CreateFileW returns. The returned owned file handle is wrapped
+        // in SafeHandle for cleanup.
         let handle = unsafe {
             CreateFileW(
                 PCWSTR(path_wide.as_ptr()),
