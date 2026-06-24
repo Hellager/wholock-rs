@@ -1,7 +1,7 @@
 use std::fmt;
 use thiserror::Error;
-use windows::core::Error as WindowsError;
 use windows::Win32::Foundation::WIN32_ERROR;
+use windows::core::Error as WindowsError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -251,8 +251,8 @@ fn first_lock_scan_warning(warnings: &[LockScanWarning]) -> String {
 }
 
 pub(crate) fn get_win32_error_message(error: &WIN32_ERROR) -> String {
+    use windows::Win32::System::Diagnostics::Debug::{FORMAT_MESSAGE_FROM_SYSTEM, FormatMessageW};
     use windows::core::PWSTR;
-    use windows::Win32::System::Diagnostics::Debug::{FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM};
 
     let mut buffer = [0u16; 512];
     // SAFETY: `buffer` is a valid writable UTF-16 buffer and its length is

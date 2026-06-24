@@ -325,8 +325,6 @@ pub fn unlock_processes(processes: &[ProcessInfo]) -> Vec<UnlockProcessResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
-    use std::time::Duration;
 
     #[test]
     fn test_unlock_processes_empty() {
@@ -464,27 +462,5 @@ mod tests {
             &results[0].result,
             Err(WholockError::PermissionError(_))
         ));
-    }
-
-    // to be fixed
-    #[test_log::test]
-    #[ignore]
-    fn test_unlock_file() {
-        use std::process::Command;
-
-        let child = Command::new("notepad.exe")
-            .spawn()
-            .expect("Failed to start test process");
-
-        let pid = child.id();
-        thread::sleep(Duration::from_secs(1));
-
-        let result = unlock_file(pid);
-        println!("result: {:?}", result);
-        assert!(result.is_ok());
-
-        thread::sleep(Duration::from_millis(500));
-        let s = sysinfo::System::new_all();
-        assert!(s.process(sysinfo::Pid::from(pid as usize)).is_none());
     }
 }

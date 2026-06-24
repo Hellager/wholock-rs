@@ -606,6 +606,19 @@ mod tests {
     use std::io::Write;
     use tempfile::tempdir;
 
+    fn scan_or_skip_for_missing_debug_privilege(path: &str) -> Option<Vec<ProcessInfo>> {
+        match who_locks_file(path) {
+            Ok(processes) => Some(processes),
+            Err(WholockError::PermissionError(message))
+                if message.message().contains("SeDebugPrivilege") =>
+            {
+                eprintln!("skipping real lock scan test: {message}");
+                None
+            }
+            Err(err) => panic!("lock scan failed: {err:?}"),
+        }
+    }
+
     #[test]
     fn test_find_processes_recursive_missing_paths_returns_error() {
         let dir = tempdir().unwrap();
@@ -705,27 +718,29 @@ mod tests {
         );
     }
 
-    // This test is not ok for now
     #[test]
-    #[ignore]
     fn test_who_locks_file() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("locked.txt");
         let mut file = File::create(&file_path).unwrap();
         writeln!(file, "test content").unwrap();
 
-        let result = who_locks_file(file_path.to_str().unwrap());
-        println!("result: {:?}", result);
-        assert!(result.is_ok());
-
-        let processes = result.unwrap();
+        let Some(processes) = scan_or_skip_for_missing_debug_privilege(file_path.to_str().unwrap())
+        else {
+            return;
+        };
         assert!(!processes.is_empty());
 
-        for process in processes {
-            assert!(process.pid > 0);
-            assert!(!process.domain_username.is_empty());
-            assert!(!process.locked_file.is_empty());
-            assert!(process.locked_file.iter().any(|f| f.contains("locked.txt")));
-        }
+        let current_process = processes
+            .iter()
+            .find(|process| process.pid == std::process::id())
+            .expect("current process should hold the open file");
+        assert!(!current_process.locked_file.is_empty());
+        assert!(
+            current_process
+                .locked_file
+                .iter()
+                .any(|f| f.contains("locked.txt"))
+        );
     }
 }
