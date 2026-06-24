@@ -556,8 +556,8 @@ pub fn who_locks_file(path: &str) -> WholockResult<Vec<ProcessInfo>> {
 /// Identifies all processes that have locked any of the specified files or directories.
 ///
 /// Directory inputs are matched recursively, so files and loaded modules underneath a
-/// requested directory are included in the result. Missing paths are ignored, matching
-/// the behavior of the single-path API.
+/// requested directory are included in the result. Empty, malformed, inaccessible, or
+/// missing paths return [`WholockError::PathError`].
 pub fn who_locks_files<I, P>(paths: I) -> WholockResult<Vec<ProcessInfo>>
 where
     I: IntoIterator<Item = P>,
@@ -570,13 +570,14 @@ where
 ///
 /// This mirrors PowerToys File Locksmith's recursive multi-path query shape.
 /// Directory inputs are matched recursively, and all paths are checked during one
-/// system handle/module scan.
+/// system handle/module scan. Empty, malformed, inaccessible, or missing paths
+/// return [`WholockError::PathError`].
 pub fn find_processes_recursive<I, P>(paths: I) -> WholockResult<Vec<ProcessInfo>>
 where
     I: IntoIterator<Item = P>,
     P: AsRef<str>,
 {
-    let matchers = LockedPathMatchers::new(paths);
+    let matchers = LockedPathMatchers::new(paths)?;
     if matchers.is_empty() {
         return Ok(Vec::new());
     }
@@ -997,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_processes_recursive_missing_paths() {
+    fn test_find_processes_recursive_missing_paths_returns_error() {
         let dir = tempdir().unwrap();
         let paths = [
             dir.path().join("missing-a.txt"),
@@ -1008,7 +1009,26 @@ mod tests {
             .map(|path| path.to_string_lossy().to_string())
             .collect::<Vec<_>>();
 
-        assert!(find_processes_recursive(paths).unwrap().is_empty());
+        assert!(matches!(
+            find_processes_recursive(paths),
+            Err(WholockError::PathError(_))
+        ));
+    }
+
+    #[test]
+    fn test_find_processes_recursive_empty_path_returns_error() {
+        assert!(matches!(
+            find_processes_recursive(std::iter::once("")),
+            Err(WholockError::PathError(_))
+        ));
+    }
+
+    #[test]
+    fn test_find_processes_recursive_nul_path_returns_error() {
+        assert!(matches!(
+            find_processes_recursive(std::iter::once("C:\\bad\0path")),
+            Err(WholockError::PathError(_))
+        ));
     }
 
     #[test]
@@ -1214,16 +1234,13 @@ mod tests {
     }
 
     #[test]
-    fn test_wait_for_unlock_missing_path_returns_unlocked() {
+    fn test_wait_for_unlock_missing_path_returns_error() {
         let dir = tempdir().unwrap();
         let missing_path = dir.path().join("missing.txt");
 
-        let result =
-            wait_for_unlock(missing_path.to_str().unwrap(), Some(Duration::from_secs(1))).unwrap();
+        let result = wait_for_unlock(missing_path.to_str().unwrap(), Some(Duration::from_secs(1)));
 
-        assert!(result.unlocked);
-        assert!(!result.timed_out());
-        assert!(result.remaining_locks.is_empty());
+        assert!(matches!(result, Err(WholockError::PathError(_))));
     }
 
     // This test is not ok for now

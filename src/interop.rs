@@ -436,10 +436,22 @@ fn lexical_absolute_path(path: &str) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().to_string())
 }
 
-pub(crate) fn target_path_is_missing(path: &str) -> bool {
+fn validate_target_path(path: &str) -> WholockResult<()> {
+    if path.trim().is_empty() {
+        return Err(WholockError::path("Target path must not be empty"));
+    }
+
+    if path.contains('\0') {
+        return Err(WholockError::path(format!(
+            "Target path contains an embedded NUL: {path:?}"
+        )));
+    }
+
     match std::fs::metadata(path).or_else(|_| std::fs::metadata(lexical_absolute_path(path))) {
-        Ok(_) => false,
-        Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+        Ok(_) => Ok(()),
+        Err(err) => Err(WholockError::path(format!(
+            "Target path does not exist or cannot be accessed: {path}: {err}"
+        ))),
     }
 }
 
@@ -492,20 +504,19 @@ pub(crate) struct LockedPathMatchers {
 }
 
 impl LockedPathMatchers {
-    pub(crate) fn new<I, P>(paths: I) -> Self
+    pub(crate) fn new<I, P>(paths: I) -> WholockResult<Self>
     where
         I: IntoIterator<Item = P>,
         P: AsRef<str>,
     {
-        let matchers = paths
-            .into_iter()
-            .filter_map(|path| {
-                let path = path.as_ref();
-                (!target_path_is_missing(path)).then(|| LockedPathMatcher::new(path))
-            })
-            .collect();
+        let mut matchers = Vec::new();
+        for path in paths {
+            let path = path.as_ref();
+            validate_target_path(path)?;
+            matchers.push(LockedPathMatcher::new(path));
+        }
 
-        Self { matchers }
+        Ok(Self { matchers })
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -531,7 +542,9 @@ where
     I: IntoIterator<Item = P>,
     P: AsRef<str>,
 {
-    LockedPathMatchers::new(target_paths).matches(path)
+    LockedPathMatchers::new(target_paths)
+        .expect("test target paths should be valid")
+        .matches(path)
 }
 
 pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
@@ -1018,12 +1031,23 @@ mod tests {
     }
 
     #[test]
-    fn test_target_path_is_missing() {
+    fn test_validate_target_path() {
         let dir = tempdir().unwrap();
         let missing_path = dir.path().join("missing.txt");
 
-        assert!(target_path_is_missing(missing_path.to_str().unwrap()));
-        assert!(!target_path_is_missing(dir.path().to_str().unwrap()));
+        assert!(matches!(
+            validate_target_path(missing_path.to_str().unwrap()),
+            Err(WholockError::PathError(_))
+        ));
+        assert!(matches!(
+            validate_target_path(""),
+            Err(WholockError::PathError(_))
+        ));
+        assert!(matches!(
+            validate_target_path("C:\\bad\0path"),
+            Err(WholockError::PathError(_))
+        ));
+        assert!(validate_target_path(dir.path().to_str().unwrap()).is_ok());
     }
 
     #[test]
