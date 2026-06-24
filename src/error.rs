@@ -26,9 +26,9 @@ impl fmt::Display for LockScanWarningKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct LockScanWarning {
-    pub pid: Option<u32>,
-    pub kind: LockScanWarningKind,
-    pub message: String,
+    pid: Option<u32>,
+    kind: LockScanWarningKind,
+    message: String,
 }
 
 impl LockScanWarning {
@@ -42,6 +42,24 @@ impl LockScanWarning {
             kind,
             message: message.into(),
         }
+    }
+
+    /// Process identifier associated with the warning, if the warning is process-specific.
+    #[must_use]
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    /// Machine-readable warning category.
+    #[must_use]
+    pub fn kind(&self) -> LockScanWarningKind {
+        self.kind
+    }
+
+    /// Human-readable warning details.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -244,11 +262,12 @@ fn first_lock_scan_warning(warnings: &[LockScanWarning]) -> String {
     };
 
     let pid = warning
-        .pid
+        .pid()
         .map_or(String::new(), |pid| format!("PID {pid} "));
     format!(
         "; first warning: {pid}{} failed: {}",
-        warning.kind, warning.message
+        warning.kind(),
+        warning.message()
     )
 }
 

@@ -20,7 +20,7 @@ fn create_locked_file() -> (tempfile::TempDir, String, File) {
 
 fn scan_processes(path: &str) -> Vec<ProcessInfo> {
     match who_locks_file(path) {
-        Ok(scan) => scan.processes,
+        Ok(scan) => scan.into_processes(),
         Err(err) => panic!("lock scan failed: {err:?}"),
     }
 }

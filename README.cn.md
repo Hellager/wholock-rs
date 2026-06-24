@@ -45,7 +45,7 @@ fn main() -> Result<(), WholockError> {
 
     let scan = who_locks_file(target)?;
 
-    scan.processes.iter().for_each(|p| {
+    scan.processes().iter().for_each(|p| {
         println!("🔒 进程 {} (PID: {}) 锁定文件:", p.process_name, p.pid);
         p.locked_file.iter().for_each(|f| println!("   - {}", f));
     });
@@ -81,8 +81,8 @@ async fn monitor_locks(path: &str) -> wholock::WholockResult<()> {
         interval.tick().await;
         let scan = who_locks_file(path)?;
     
-        if !scan.processes.is_empty() {
-            send_alert(&scan.processes).await?;
+        if !scan.processes().is_empty() {
+            send_alert(scan.processes()).await?;
         }
     }
 }

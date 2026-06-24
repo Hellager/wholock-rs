@@ -93,8 +93,8 @@ where
 
     loop {
         let scan = find_processes_recursive(paths.iter().map(String::as_str))?;
-        warnings.extend(scan.warnings);
-        let remaining_locks = scan.processes;
+        let (remaining_locks, scan_warnings) = scan.into_parts();
+        warnings.extend(scan_warnings);
         let elapsed = start.elapsed();
 
         if remaining_locks.is_empty() {

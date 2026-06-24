@@ -89,17 +89,17 @@ fn main() {
     match who_locks_file(&file_path) {
         Ok(scan) => {
             if json_output {
-                match processes_to_json(&scan.processes) {
+                match processes_to_json(scan.processes()) {
                     Ok(json) => println!("{json}"),
                     Err(e) => eprintln!("Error: {}", e),
                 }
-            } else if scan.processes.is_empty() {
+            } else if scan.processes().is_empty() {
                 println!("No process is locking the file: {}", file_path);
             } else {
                 println!("\nProcesses locking the file {}:", file_path);
                 println!("{:-<50}", "");
 
-                for process in &scan.processes {
+                for process in scan.processes() {
                     println!("PID: {}", process.pid);
                     println!("Process Name: {}", process.process_name);
                     println!("Executable Path: {}", process.process_exe_path);
@@ -113,7 +113,7 @@ fn main() {
             }
 
             if should_unlock {
-                for unlock in unlock_processes(&scan.processes) {
+                for unlock in unlock_processes(scan.processes()) {
                     let status = format!(
                         "Attempting to unlock by terminating process {}...",
                         unlock.pid

@@ -460,7 +460,7 @@ fn handle_table_warning(err: WholockError) -> LockScanWarning {
 /// Scans files and directories for matching lock holders.
 ///
 /// This is the primary scan API. It follows PowerToys File Locksmith's default
-/// behavior when [`LockScanOptions::require_debug_privilege`] is `false`: wholock
+/// behavior when [`LockScanOptions::debug_privilege_required`] is `false`: wholock
 /// attempts to enable debug privilege to improve visibility, records a warning if
 /// that fails, and continues scanning processes that are still accessible.
 ///
@@ -481,16 +481,16 @@ fn handle_table_warning(err: WholockError) -> LockScanWarning {
 /// # Errors
 ///
 /// Returns a `WholockError` if path validation fails, or if debug privilege setup fails
-/// while [`LockScanOptions::require_debug_privilege`] is enabled.
+/// while [`LockScanOptions::debug_privilege_required`] is enabled.
 ///
 /// # Examples
 ///
 /// ```no_run
 /// use wholock::{LockScanOptions, scan_locks};
 ///
-/// let scan = scan_locks(["C:\\work", "C:\\data\\locked.txt"], LockScanOptions::default())?;
+/// let scan = scan_locks(["C:\\work", "C:\\data\\locked.txt"], LockScanOptions::new())?;
 ///
-/// for process in &scan.processes {
+/// for process in scan.processes() {
 ///     println!("PID {}: {}", process.pid, process.process_name);
 /// }
 /// # Ok::<(), wholock::error::WholockError>(())
@@ -508,7 +508,7 @@ where
     let mut warnings = Vec::new();
     handle_debug_privilege_result(
         enable_debug_privilege(),
-        options.require_debug_privilege,
+        options.debug_privilege_required(),
         &mut warnings,
     )?;
 
@@ -529,7 +529,7 @@ where
                 let (handle_results, handle_warnings) = collect_handle_locks_parallel(
                     handle_groups.into_iter().collect(),
                     Arc::clone(&matchers),
-                    options.handle_probe_timeout,
+                    options.handle_probe_timeout(),
                 );
                 result.extend(handle_results);
                 warnings.extend(handle_warnings);
@@ -539,7 +539,7 @@ where
         Err(err) => warnings.push(handle_table_warning(err)),
     }
 
-    if options.include_modules {
+    if options.module_scan_enabled() {
         let system = sysinfo::System::new_all();
         for pid in system
             .processes()
@@ -571,7 +571,7 @@ where
 /// Identifies all processes that have locked a specified file.
 ///
 /// This is a convenience wrapper around [`find_processes_recursive`] using
-/// [`LockScanOptions::default`].
+/// [`LockScanOptions::new`].
 ///
 /// # Arguments
 ///
@@ -594,7 +594,7 @@ where
 ///
 /// match who_locks_file("C:\\path\\to\\file.txt") {
 ///     Ok(scan) => {
-///         for process in scan.processes {
+///         for process in scan.processes() {
 ///             println!("Process {} ({}) has locked the file", process.process_name, process.pid);
 ///         }
 ///     },
@@ -634,7 +634,7 @@ pub fn who_locks_file(path: &str) -> WholockResult<LockScanResult> {
 ///     "C:\\path\\to\\directory",
 /// ])?;
 ///
-/// for process in scan.processes {
+/// for process in scan.processes() {
 ///     println!("{} locks {:?}", process.process_name, process.locked_file);
 /// }
 /// # Ok::<(), wholock::error::WholockError>(())
@@ -675,7 +675,7 @@ where
 ///
 /// let scan = find_processes_recursive(vec!["C:\\work", "C:\\data\\locked.txt"])?;
 ///
-/// for process in scan.processes {
+/// for process in scan.processes() {
 ///     println!("PID {}: {}", process.pid, process.process_name);
 /// }
 /// # Ok::<(), wholock::error::WholockError>(())
@@ -685,7 +685,7 @@ where
     I: IntoIterator<Item = P>,
     P: AsRef<str>,
 {
-    scan_locks(paths, LockScanOptions::default())
+    scan_locks(paths, LockScanOptions::new())
 }
 
 #[cfg(test)]
@@ -698,7 +698,7 @@ mod tests {
     fn scan_processes(path: &str) -> Vec<ProcessInfo> {
         who_locks_file(path)
             .unwrap_or_else(|err| panic!("lock scan failed: {err:?}"))
-            .processes
+            .into_processes()
     }
 
     #[test]
@@ -744,9 +744,9 @@ mod tests {
         );
         let result = finish_lock_scan(BTreeMap::new(), vec![warning]);
 
-        assert!(result.processes.is_empty());
-        assert_eq!(result.warnings.len(), 1);
-        assert!(!result.is_complete());
+        assert!(result.processes().is_empty());
+        assert_eq!(result.warnings().len(), 1);
+        assert!(!result.is_complete_success());
     }
 
     #[test]
@@ -807,7 +807,7 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(matches!(
-            warnings.first().map(|warning| warning.kind),
+            warnings.first().map(LockScanWarning::kind),
             Some(LockScanWarningKind::DebugPrivilege)
         ));
     }
@@ -829,9 +829,9 @@ mod tests {
     fn test_handle_table_warning_is_recoverable_warning() {
         let warning = handle_table_warning(WholockError::system_info("buffer too small"));
 
-        assert_eq!(warning.pid, None);
-        assert_eq!(warning.kind, LockScanWarningKind::HandleEnumeration);
-        assert!(warning.message.contains("buffer too small"));
+        assert_eq!(warning.pid(), None);
+        assert_eq!(warning.kind(), LockScanWarningKind::HandleEnumeration);
+        assert!(warning.message().contains("buffer too small"));
     }
 
     #[test]
