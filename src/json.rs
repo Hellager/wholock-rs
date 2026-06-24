@@ -5,6 +5,7 @@ use serde::Serialize;
 struct JsonProcess<'a> {
     pid: u32,
     name: &'a str,
+    exe_path: &'a str,
     user: &'a str,
     files: &'a [String],
 }
@@ -21,6 +22,7 @@ fn json_process_list(processes: &[ProcessInfo]) -> JsonProcessList<'_> {
             .map(|process| JsonProcess {
                 pid: process.pid,
                 name: &process.process_name,
+                exe_path: &process.process_exe_path,
                 user: &process.domain_username,
                 files: &process.locked_file,
             })
@@ -30,7 +32,7 @@ fn json_process_list(processes: &[ProcessInfo]) -> JsonProcessList<'_> {
 
 /// Serializes process lock results as PowerToys-compatible JSON.
 ///
-/// The output shape is `{ "processes": [{ "pid", "name", "user", "files" }] }`.
+/// The output shape is `{ "processes": [{ "pid", "name", "exe_path", "user", "files" }] }`.
 ///
 /// # Arguments
 ///
@@ -85,6 +87,7 @@ mod tests {
 
         assert_eq!(value["processes"][0]["pid"], 42);
         assert_eq!(value["processes"][0]["name"], "locker.exe");
+        assert_eq!(value["processes"][0]["exe_path"], r"C:\tools\locker.exe");
         assert_eq!(value["processes"][0]["user"], r"DOMAIN\user");
         assert_eq!(value["processes"][0]["files"][0], r"C:\data\locked.txt");
         assert!(value["processes"][0].get("process_name").is_none());
