@@ -1,6 +1,6 @@
 [package]
 name = "wholock"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Hellager"] 
@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT" 
 keywords = ["windows", "lock"] 
 description = """ 
-A rust crate helps you to find out who's locking your file on windows
+find out who's locking your file on windows
 """
 
 [dependencies]
