@@ -90,7 +90,7 @@ pub(crate) fn validate_target_path(path: &str) -> WholockResult<()> {
     match std::fs::metadata(path).or_else(|_| std::fs::metadata(lexical_absolute_path(path))) {
         Ok(_) => Ok(()),
         Err(err) => Err(WholockError::path(format!(
-            "Target path does not exist or cannot be accessed: {path}: {err}"
+            "Target path does not exist or cannot be accessed: {path:?}: {err}"
         ))),
     }
 }
@@ -263,6 +263,10 @@ mod tests {
             validate_target_path(missing_path.to_str().unwrap()),
             Err(WholockError::PathError(_))
         ));
+        let missing_message = validate_target_path(missing_path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(missing_message.contains(&format!("{:?}", missing_path.to_str().unwrap())));
         assert!(matches!(
             validate_target_path(""),
             Err(WholockError::PathError(_))
