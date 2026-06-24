@@ -132,7 +132,7 @@ pub(crate) fn query_system_information_buffer(
                 buffer.reserve_exact(return_length);
                 buffer.resize(return_length, 0);
             } else {
-                return Err(WholockError::SystemInfoError(
+                return Err(WholockError::system_info(
                     "Failed to query system information".to_string(),
                 ));
             }
@@ -222,7 +222,7 @@ fn duplicate_handle_blocking(
         Ok(_) => Ok(target_handle),
         Err(_) => {
             let err = unsafe { windows::Win32::Foundation::GetLastError() };
-            Err(WholockError::Win32Error(err))
+            Err(err.into())
         }
     }
 }
@@ -264,7 +264,7 @@ pub(crate) fn get_object_type_name(handle: HANDLE) -> WholockResult<String> {
             continue;
         }
 
-        return Err(WholockError::Win32Error(WIN32_ERROR(status.0 as u32)));
+        return Err(WIN32_ERROR(status.0 as u32).into());
     }
 }
 
@@ -281,7 +281,7 @@ pub(crate) fn get_final_path_name_by_handle(h_file: &HANDLE) -> WholockResult<St
         };
 
         if result == 0 {
-            return Err(WholockError::Win32Error(unsafe { GetLastError() }));
+            return Err(unsafe { GetLastError() }.into());
         }
 
         let result = result as usize;
@@ -338,7 +338,7 @@ fn handle_lookup_account_sid_failure(error: WIN32_ERROR) -> WholockResult<String
         return Ok(String::new());
     }
 
-    Err(WholockError::ProcessError(format!(
+    Err(WholockError::process(format!(
         "LookupAccountSidW failed: {}",
         get_win32_error_message(&error)
     )))
@@ -620,7 +620,7 @@ pub(crate) fn enable_debug_privilege() -> WholockResult<()> {
 
         let last_error = GetLastError();
         if last_error == ERROR_NOT_ALL_ASSIGNED {
-            return Err(WholockError::PermissionError(
+            return Err(WholockError::permission(
                 "SeDebugPrivilege is not assigned to the current process token".to_string(),
             ));
         }
@@ -650,7 +650,7 @@ struct SafeHandle(HANDLE);
 impl SafeHandle {
     fn new(handle: HANDLE) -> WholockResult<Self> {
         if handle.is_invalid() {
-            return Err(WholockError::HandleError("Invalid handle".to_string()));
+            return Err(WholockError::handle("Invalid handle"));
         }
         Ok(Self(handle))
     }
@@ -679,7 +679,7 @@ fn convert_wide_buffer(buffer: &[u16], len: usize) -> WholockResult<String> {
     let os_str = OsString::from_wide(&buffer[..len]);
     os_str
         .into_string()
-        .map_err(|_| WholockError::EncodingError("Invalid UTF-16 sequence".to_string()))
+        .map_err(|_| WholockError::encoding("Invalid UTF-16 sequence"))
 }
 
 fn extract_filename(path: &str) -> WholockResult<String> {
@@ -687,13 +687,13 @@ fn extract_filename(path: &str) -> WholockResult<String> {
         .file_name()
         .and_then(|n| n.to_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| WholockError::PathError("Invalid file path".to_string()))
+        .ok_or_else(|| WholockError::path("Invalid file path"))
 }
 
 pub(crate) fn get_process_info(pid: u32) -> WholockResult<(String, String)> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).map_err(|e| {
-            WholockError::ProcessError(format!(
+            WholockError::process(format!(
                 "Failed to open process {}: {}",
                 pid,
                 get_win32_error_message(&WIN32_ERROR(e.code().0 as u32))
@@ -711,7 +711,7 @@ pub(crate) fn get_process_info(pid: u32) -> WholockResult<(String, String)> {
             PWSTR::from_raw(buffer.as_mut_ptr()),
             &mut size,
         )
-        .map_err(|e| WholockError::Win32Error(WIN32_ERROR(e.code().0 as u32)))?;
+        .map_err(|e| WholockError::from(WIN32_ERROR(e.code().0 as u32)))?;
 
         let path_str = convert_wide_buffer(&buffer, size as usize)?;
         let exe_name = extract_filename(&path_str)?;
@@ -730,7 +730,7 @@ pub(crate) fn get_process_module_paths(pid: u32) -> WholockResult<Vec<String>> {
         let handle = match OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) {
             Ok(handle) => handle,
             Err(e) => {
-                return Err(WholockError::ProcessError(format!(
+                return Err(WholockError::process(format!(
                     "Failed to open process {} for module enumeration: {}",
                     pid,
                     get_win32_error_message(&WIN32_ERROR(e.code().0 as u32))
@@ -738,7 +738,7 @@ pub(crate) fn get_process_module_paths(pid: u32) -> WholockResult<Vec<String>> {
             }
         };
         let safe_handle = SafeHandle::new(handle).map_err(|err| {
-            WholockError::ProcessError(format!(
+            WholockError::process(format!(
                 "Failed to open process {pid} for module enumeration: {err}"
             ))
         })?;
@@ -749,14 +749,14 @@ pub(crate) fn get_process_module_paths(pid: u32) -> WholockResult<Vec<String>> {
             let mut needed = 0u32;
             let buffer_bytes = modules.len() * mem::size_of::<HMODULE>();
             let buffer_bytes = u32::try_from(buffer_bytes)
-                .map_err(|_| WholockError::Other("Module buffer is too large".to_string()))?;
+                .map_err(|_| WholockError::other("Module buffer is too large"))?;
             if let Err(e) = EnumProcessModules(
                 safe_handle.as_raw(),
                 modules.as_mut_ptr(),
                 buffer_bytes,
                 &mut needed,
             ) {
-                return Err(WholockError::ProcessError(format!(
+                return Err(WholockError::process(format!(
                     "EnumProcessModules failed for PID {}: {}",
                     pid,
                     get_win32_error_message(&WIN32_ERROR(e.code().0 as u32))
@@ -953,7 +953,7 @@ mod tests {
             .is_empty());
         assert!(matches!(
             handle_lookup_account_sid_failure(WIN32_ERROR(5)),
-            Err(WholockError::ProcessError(message)) if message.contains("LookupAccountSidW failed")
+            Err(WholockError::ProcessError(message)) if message.message().contains("LookupAccountSidW failed")
         ));
     }
 

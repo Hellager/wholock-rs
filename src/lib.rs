@@ -74,34 +74,34 @@ impl ProcessTerminationFailure {
         match self.kind {
             ProcessTerminationFailureKind::InvalidPid => WholockError::InvalidPID(self.pid),
             ProcessTerminationFailureKind::ProtectedProcess => {
-                WholockError::PermissionError(format!(
+                WholockError::permission(format!(
                     "Refusing to terminate protected system process {}: {}",
                     self.pid, self.reason
                 ))
             }
             ProcessTerminationFailureKind::StaleProcessIdentity => {
-                WholockError::ProcessError(format!(
+                WholockError::process(format!(
                     "Refusing to terminate process {} because its identity changed: {}",
                     self.pid, self.reason
                 ))
             }
             ProcessTerminationFailureKind::LockNoLongerHeld => {
-                WholockError::ProcessError(format!(
+                WholockError::process(format!(
                     "Refusing to terminate process {} because it no longer holds the requested locks: {}",
                     self.pid, self.reason
                 ))
             }
             ProcessTerminationFailureKind::LockVerification => {
-                WholockError::ProcessError(format!(
+                WholockError::process(format!(
                     "Failed to verify locks before terminating process {}: {}",
                     self.pid, self.reason
                 ))
             }
-            ProcessTerminationFailureKind::OpenProcess => WholockError::ProcessError(format!(
+            ProcessTerminationFailureKind::OpenProcess => WholockError::process(format!(
                 "Failed to open process {} for termination: {}",
                 self.pid, self.reason
             )),
-            ProcessTerminationFailureKind::TerminateProcess => WholockError::ProcessError(format!(
+            ProcessTerminationFailureKind::TerminateProcess => WholockError::process(format!(
                 "Failed to terminate process {}: {}",
                 self.pid, self.reason
             )),
@@ -154,7 +154,7 @@ fn json_process_list(processes: &[ProcessInfo]) -> JsonProcessList<'_> {
 /// The output shape is `{ "processes": [{ "pid", "name", "user", "files" }] }`.
 pub fn processes_to_json(processes: &[ProcessInfo]) -> WholockResult<String> {
     serde_json::to_string(&json_process_list(processes))
-        .map_err(|err| WholockError::Other(format!("Failed to serialize JSON output: {err}")))
+        .map_err(|err| WholockError::other(format!("Failed to serialize JSON output: {err}")))
 }
 
 struct HandleWrapper(HANDLE);
@@ -269,7 +269,7 @@ pub fn start_as_elevated() -> WholockResult<()> {
 
     let code = result.0 as usize;
     if code <= 32 {
-        return Err(WholockError::Win32Error(WIN32_ERROR(code as u32)));
+        return Err(WIN32_ERROR(code as u32).into());
     }
 
     Ok(())
@@ -501,7 +501,7 @@ fn module_scan_warning(pid: u32, err: WholockError) -> LockScanWarning {
 }
 
 fn debug_privilege_error(err: WholockError) -> WholockError {
-    WholockError::PermissionError(format!(
+    WholockError::permission(format!(
         "Failed to enable SeDebugPrivilege before scanning locks: {err}"
     ))
 }
@@ -1035,12 +1035,12 @@ mod tests {
 
     #[test]
     fn test_debug_privilege_error_maps_to_permission_error() {
-        let error = debug_privilege_error(WholockError::PermissionError(
+        let error = debug_privilege_error(WholockError::permission(
             "SeDebugPrivilege is not assigned".to_string(),
         ));
 
         assert!(
-            matches!(error, WholockError::PermissionError(message) if message.contains("SeDebugPrivilege"))
+            matches!(error, WholockError::PermissionError(message) if message.message().contains("SeDebugPrivilege"))
         );
     }
 

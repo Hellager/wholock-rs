@@ -1,8 +1,10 @@
 use std::fmt;
+use thiserror::Error;
 use windows::core::Error as WindowsError;
 use windows::Win32::Foundation::WIN32_ERROR;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LockScanWarningKind {
     OpenProcess,
     ModuleEnumeration,
@@ -18,6 +20,7 @@ impl fmt::Display for LockScanWarningKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LockScanWarning {
     pub pid: Option<u32>,
     pub kind: LockScanWarningKind,
@@ -38,67 +41,156 @@ impl LockScanWarning {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageError {
+    message: String,
+}
+
+impl MessageError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for MessageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MessageError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Win32Error {
+    code: WIN32_ERROR,
+}
+
+impl Win32Error {
+    pub(crate) fn new(code: WIN32_ERROR) -> Self {
+        Self { code }
+    }
+
+    #[must_use]
+    pub fn code(&self) -> WIN32_ERROR {
+        self.code
+    }
+
+    #[must_use]
+    pub fn message(&self) -> String {
+        get_win32_error_message(&self.code)
+    }
+}
+
+impl fmt::Display for Win32Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Win32 error code {}: {}",
+            self.code.0,
+            get_win32_error_message(&self.code)
+        )
+    }
+}
+
+impl std::error::Error for Win32Error {}
+
+#[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum WholockError {
-    WindowsError(WindowsError),
-    Win32Error(WIN32_ERROR),
-    IoError(std::io::Error),
-    SystemInfoError(String),
-    HandleError(String),
-    EncodingError(String),
-    PathError(String),
-    ProcessError(String),
-    PermissionError(String),
+    #[error("Windows API error: {0}")]
+    WindowsError(#[from] WindowsError),
+
+    #[error("{0}")]
+    Win32Error(#[source] Win32Error),
+
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
+
+    #[error("System info error: {0}")]
+    SystemInfoError(#[source] MessageError),
+
+    #[error("Handle operation error: {0}")]
+    HandleError(#[source] MessageError),
+
+    #[error("Encoding error: {0}")]
+    EncodingError(#[source] MessageError),
+
+    #[error("Path error: {0}")]
+    PathError(#[source] MessageError),
+
+    #[error("Process error: {0}")]
+    ProcessError(#[source] MessageError),
+
+    #[error("Permission error: {0}")]
+    PermissionError(#[source] MessageError),
+
+    #[error("Invalid PID: {0}")]
     InvalidPID(u32),
+
+    #[error(
+        "Partial lock scan: found {} process(es), but {} scan warning(s) occurred{}",
+        processes.len(),
+        warnings.len(),
+        first_lock_scan_warning(warnings)
+    )]
     PartialLockScan {
         processes: Vec<crate::ProcessInfo>,
         warnings: Vec<LockScanWarning>,
     },
-    Other(String),
+
+    #[error("{0}")]
+    Other(#[source] MessageError),
 }
 
-impl std::error::Error for WholockError {}
-
-impl fmt::Display for WholockError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            WholockError::WindowsError(e) => write!(f, "Windows API error: {}", e),
-            WholockError::Win32Error(e) => write!(
-                f,
-                "Win32 error code {}: {}",
-                e.0,
-                get_win32_error_message(e)
-            ),
-            WholockError::IoError(e) => write!(f, "IO error: {}", e),
-            WholockError::SystemInfoError(e) => write!(f, "System info error: {}", e),
-            WholockError::HandleError(e) => write!(f, "Handle operation error: {}", e),
-            WholockError::EncodingError(e) => write!(f, "Encoding error: {}", e),
-            WholockError::PathError(e) => write!(f, "Path error: {}", e),
-            WholockError::ProcessError(e) => write!(f, "Process error: {}", e),
-            WholockError::PermissionError(e) => write!(f, "Permission error: {}", e),
-            WholockError::InvalidPID(e) => write!(f, "Invalid PID: {}", e),
-            WholockError::PartialLockScan {
-                processes,
-                warnings,
-            } => {
-                write!(
-                    f,
-                    "Partial lock scan: found {} process(es), but {} scan warning(s) occurred",
-                    processes.len(),
-                    warnings.len()
-                )?;
-                if let Some(warning) = warnings.first() {
-                    write!(f, "; first warning: ")?;
-                    if let Some(pid) = warning.pid {
-                        write!(f, "PID {pid} ")?;
-                    }
-                    write!(f, "{} failed: {}", warning.kind, warning.message)?;
-                }
-                Ok(())
-            }
-            WholockError::Other(e) => write!(f, "{}", e),
-        }
+impl WholockError {
+    pub(crate) fn system_info(message: impl Into<String>) -> Self {
+        Self::SystemInfoError(MessageError::new(message))
     }
+
+    pub(crate) fn handle(message: impl Into<String>) -> Self {
+        Self::HandleError(MessageError::new(message))
+    }
+
+    pub(crate) fn encoding(message: impl Into<String>) -> Self {
+        Self::EncodingError(MessageError::new(message))
+    }
+
+    pub(crate) fn path(message: impl Into<String>) -> Self {
+        Self::PathError(MessageError::new(message))
+    }
+
+    pub(crate) fn process(message: impl Into<String>) -> Self {
+        Self::ProcessError(MessageError::new(message))
+    }
+
+    pub(crate) fn permission(message: impl Into<String>) -> Self {
+        Self::PermissionError(MessageError::new(message))
+    }
+
+    pub(crate) fn other(message: impl Into<String>) -> Self {
+        Self::Other(MessageError::new(message))
+    }
+}
+
+fn first_lock_scan_warning(warnings: &[LockScanWarning]) -> String {
+    let Some(warning) = warnings.first() else {
+        return String::new();
+    };
+
+    let pid = warning
+        .pid
+        .map_or(String::new(), |pid| format!("PID {pid} "));
+    format!(
+        "; first warning: {pid}{} failed: {}",
+        warning.kind, warning.message
+    )
 }
 
 pub(crate) fn get_win32_error_message(error: &WIN32_ERROR) -> String {
@@ -125,26 +217,14 @@ pub(crate) fn get_win32_error_message(error: &WIN32_ERROR) -> String {
     }
 }
 
-impl From<WindowsError> for WholockError {
-    fn from(error: WindowsError) -> Self {
-        WholockError::WindowsError(error)
-    }
-}
-
 impl From<WIN32_ERROR> for WholockError {
     fn from(error: WIN32_ERROR) -> Self {
-        WholockError::Win32Error(error)
-    }
-}
-
-impl From<std::io::Error> for WholockError {
-    fn from(error: std::io::Error) -> Self {
-        WholockError::IoError(error)
+        WholockError::Win32Error(Win32Error::new(error))
     }
 }
 
 impl From<String> for WholockError {
     fn from(error: String) -> Self {
-        WholockError::Other(error)
+        WholockError::other(error)
     }
 }
