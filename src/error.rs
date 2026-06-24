@@ -7,6 +7,7 @@ use windows::Win32::Foundation::WIN32_ERROR;
 #[non_exhaustive]
 pub enum LockScanWarningKind {
     OpenProcess,
+    HandleEnumeration,
     ModuleEnumeration,
 }
 
@@ -14,6 +15,7 @@ impl fmt::Display for LockScanWarningKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LockScanWarningKind::OpenProcess => f.write_str("open process"),
+            LockScanWarningKind::HandleEnumeration => f.write_str("handle enumeration"),
             LockScanWarningKind::ModuleEnumeration => f.write_str("module enumeration"),
         }
     }

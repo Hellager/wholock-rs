@@ -9,9 +9,19 @@ use crate::interop::{
 use crate::{WholockResult, types::ProcessInfo};
 use itertools::Itertools;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::panic::AssertUnwindSafe;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+    mpsc::{self, RecvTimeoutError},
+};
+use std::time::Duration;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess};
+
+const HANDLE_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+const MAX_ACTIVE_HANDLE_PROBE_WORKERS: usize = 32;
+static ACTIVE_HANDLE_PROBE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) struct HandleWrapper(HANDLE);
 
@@ -39,6 +49,119 @@ impl Drop for HandleWrapper {
             }
         }
     }
+}
+
+struct ActiveHandleProbeWorkerGuard;
+
+impl Drop for ActiveHandleProbeWorkerGuard {
+    fn drop(&mut self) {
+        ACTIVE_HANDLE_PROBE_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn acquire_active_handle_probe_worker() -> Option<ActiveHandleProbeWorkerGuard> {
+    loop {
+        let current = ACTIVE_HANDLE_PROBE_WORKERS.load(Ordering::Acquire);
+        if current >= MAX_ACTIVE_HANDLE_PROBE_WORKERS {
+            return None;
+        }
+
+        if ACTIVE_HANDLE_PROBE_WORKERS
+            .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Some(ActiveHandleProbeWorkerGuard);
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HandleProbeOutcome {
+    Path(String),
+    NoMatch,
+    TimedOut,
+    WorkerLimitReached,
+    WorkerDisconnected,
+    WorkerPanicked,
+    SpawnFailed(String),
+}
+
+fn run_handle_probe_with_timeout<F>(timeout: Duration, probe: F) -> HandleProbeOutcome
+where
+    F: FnOnce() -> WholockResult<Option<String>> + Send + 'static,
+{
+    if timeout.is_zero() {
+        return HandleProbeOutcome::TimedOut;
+    }
+
+    let Some(active_worker) = acquire_active_handle_probe_worker() else {
+        return HandleProbeOutcome::WorkerLimitReached;
+    };
+    let (tx, rx) = mpsc::channel();
+
+    let spawn_result = std::thread::Builder::new()
+        .name("wholock-handle-probe".into())
+        .spawn(move || {
+            let _active_worker = active_worker;
+            let result = std::panic::catch_unwind(AssertUnwindSafe(probe));
+            let _ = tx.send(result);
+        });
+
+    if let Err(err) = spawn_result {
+        return HandleProbeOutcome::SpawnFailed(err.to_string());
+    }
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(Ok(Some(path)))) => HandleProbeOutcome::Path(path),
+        Ok(Ok(Ok(None) | Err(_))) => HandleProbeOutcome::NoMatch,
+        Ok(Err(_)) => HandleProbeOutcome::WorkerPanicked,
+        Err(RecvTimeoutError::Timeout) => HandleProbeOutcome::TimedOut,
+        Err(RecvTimeoutError::Disconnected) => HandleProbeOutcome::WorkerDisconnected,
+    }
+}
+
+fn probe_handle_path_blocking(pid: u32, source_handle: usize) -> WholockResult<Option<String>> {
+    // SAFETY: OpenProcess is called with a PID read from the system handle table.
+    // The returned process HANDLE is owned by this worker and closed by
+    // `HandleWrapper` before the worker exits.
+    let Ok(handle_owner_process) = (unsafe {
+        OpenProcess(
+            PROCESS_ACCESS_RIGHTS_DUP_HANDLE | PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
+            false,
+            pid,
+        )
+    }) else {
+        return Ok(None);
+    };
+    let handle_owner_process = HandleWrapper::new(handle_owner_process);
+    if handle_owner_process.is_invalid() {
+        return Ok(None);
+    }
+
+    // SAFETY: GetCurrentProcess returns the documented pseudo-handle for the
+    // current process. It must not be closed and is only passed to DuplicateHandle.
+    let current_process = unsafe { GetCurrentProcess() };
+    let Ok(dup_handle) =
+        duplicate_handle_value(current_process, handle_owner_process.get(), source_handle)
+    else {
+        return Ok(None);
+    };
+    let dup_handle = HandleWrapper::new(dup_handle);
+    if dup_handle.is_invalid() {
+        return Ok(None);
+    }
+
+    if !is_file_handle(dup_handle.get()) {
+        return Ok(None);
+    }
+
+    Ok(get_final_path_name_by_handle(&dup_handle.get()).ok())
+}
+
+fn probe_handle_path_with_timeout(pid: u32, source_handle: usize) -> HandleProbeOutcome {
+    run_handle_probe_with_timeout(HANDLE_PROBE_TIMEOUT, move || {
+        probe_handle_path_blocking(pid, source_handle)
+    })
 }
 
 struct ProcessLockCollector {
@@ -147,13 +270,6 @@ struct ProcessHandleScanResult {
 }
 
 impl ProcessHandleScanResult {
-    fn warning(pid: u32, kind: LockScanWarningKind, message: impl Into<String>) -> Self {
-        Self {
-            process_info: None,
-            warnings: vec![LockScanWarning::new(Some(pid), kind, message)],
-        }
-    }
-
     fn with_process_info(
         process_info: ProcessLockCollector,
         warnings: Vec<LockScanWarning>,
@@ -193,56 +309,52 @@ fn scan_process_handles(
     handle_values: &[usize],
     matchers: &LockedPathMatchers,
 ) -> ProcessHandleScanResult {
-    // SAFETY: OpenProcess is called with a concrete PID from the system handle
-    // table. It returns an owned process HANDLE on success, which is immediately
-    // wrapped in `HandleWrapper` for cleanup.
-    let Ok(open_process) = (unsafe {
-        OpenProcess(
-            PROCESS_ACCESS_RIGHTS_DUP_HANDLE | PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
-            false,
-            pid,
-        )
-    }) else {
-        return ProcessHandleScanResult::warning(
-            pid,
-            LockScanWarningKind::OpenProcess,
-            "failed to open process for handle duplication",
-        );
-    };
-    let open_process = HandleWrapper::new(open_process);
-    if open_process.is_invalid() {
-        return ProcessHandleScanResult::warning(
-            pid,
-            LockScanWarningKind::OpenProcess,
-            "OpenProcess returned an invalid handle",
-        );
+    if let Err(warning) = verify_process_can_be_scanned(pid) {
+        return ProcessHandleScanResult {
+            process_info: None,
+            warnings: vec![warning],
+        };
     }
 
-    // SAFETY: GetCurrentProcess returns the documented pseudo-handle for the
-    // current process. It must not be closed and is only passed to DuplicateHandle.
-    let current_process: windows::Win32::Foundation::HANDLE = unsafe { GetCurrentProcess() };
     let mut locked_files = BTreeSet::new();
-    let warnings = Vec::new();
+    let mut warnings = Vec::new();
 
     for handle_value in handle_values {
-        let dup_handle =
-            match duplicate_handle_value(current_process, open_process.get(), *handle_value) {
-                Ok(handle) => handle,
-                Err(_) => continue,
-            };
-        let dup_handle = HandleWrapper::new(dup_handle);
-        if dup_handle.is_invalid() {
-            continue;
-        }
-
-        if !is_file_handle(dup_handle.get()) {
-            continue;
-        }
-
-        if let Ok(full_name) = get_final_path_name_by_handle(&dup_handle.get()) {
-            if matchers.matches(&full_name) {
-                locked_files.insert(full_name);
+        match probe_handle_path_with_timeout(pid, *handle_value) {
+            HandleProbeOutcome::Path(full_name) => {
+                if matchers.matches(&full_name) {
+                    locked_files.insert(full_name);
+                }
             }
+            HandleProbeOutcome::NoMatch => {}
+            HandleProbeOutcome::TimedOut => warnings.push(LockScanWarning::new(
+                Some(pid),
+                LockScanWarningKind::HandleEnumeration,
+                format!(
+                    "handle {handle_value:#x} did not finish within {}ms",
+                    HANDLE_PROBE_TIMEOUT.as_millis()
+                ),
+            )),
+            HandleProbeOutcome::WorkerLimitReached => warnings.push(LockScanWarning::new(
+                Some(pid),
+                LockScanWarningKind::HandleEnumeration,
+                "too many timed-out handle probes are still running",
+            )),
+            HandleProbeOutcome::WorkerDisconnected => warnings.push(LockScanWarning::new(
+                Some(pid),
+                LockScanWarningKind::HandleEnumeration,
+                format!("handle {handle_value:#x} probe worker disconnected"),
+            )),
+            HandleProbeOutcome::WorkerPanicked => warnings.push(LockScanWarning::new(
+                Some(pid),
+                LockScanWarningKind::HandleEnumeration,
+                format!("handle {handle_value:#x} probe worker panicked"),
+            )),
+            HandleProbeOutcome::SpawnFailed(message) => warnings.push(LockScanWarning::new(
+                Some(pid),
+                LockScanWarningKind::HandleEnumeration,
+                format!("failed to spawn handle probe worker: {message}"),
+            )),
         }
     }
 
@@ -253,11 +365,53 @@ fn scan_process_handles(
         };
     }
 
-    let domain_username = get_handle_owner_info(open_process.get()).ok();
+    let domain_username = get_process_owner_info(pid).ok();
     ProcessHandleScanResult::with_process_info(
         ProcessLockCollector::with_locked_files(pid, domain_username, locked_files),
         warnings,
     )
+}
+
+fn verify_process_can_be_scanned(pid: u32) -> Result<(), LockScanWarning> {
+    // SAFETY: OpenProcess is called with a concrete PID from the system handle
+    // table. The returned process HANDLE is used only as a capability preflight
+    // and is closed before any timeout-protected worker is spawned.
+    let Ok(handle) = (unsafe {
+        OpenProcess(
+            PROCESS_ACCESS_RIGHTS_DUP_HANDLE | PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
+            false,
+            pid,
+        )
+    }) else {
+        return Err(LockScanWarning::new(
+            Some(pid),
+            LockScanWarningKind::OpenProcess,
+            "failed to open process for handle duplication",
+        ));
+    };
+
+    let handle = HandleWrapper::new(handle);
+    if handle.is_invalid() {
+        return Err(LockScanWarning::new(
+            Some(pid),
+            LockScanWarningKind::OpenProcess,
+            "OpenProcess returned an invalid handle",
+        ));
+    }
+
+    Ok(())
+}
+
+fn get_process_owner_info(pid: u32) -> WholockResult<String> {
+    // SAFETY: OpenProcess is called with a concrete PID and returns an owned
+    // process HANDLE on success, which is wrapped in `HandleWrapper` for cleanup.
+    let handle = unsafe { OpenProcess(PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION, false, pid) }?;
+    let handle = HandleWrapper::new(handle);
+    if handle.is_invalid() {
+        return Ok(String::new());
+    }
+
+    get_handle_owner_info(handle.get())
 }
 
 fn module_scan_warning(pid: u32, err: WholockError) -> LockScanWarning {
@@ -490,8 +644,8 @@ mod tests {
     fn test_finish_lock_scan_returns_partial_error_with_warnings() {
         let warning = LockScanWarning::new(
             Some(42),
-            LockScanWarningKind::OpenProcess,
-            "access is denied",
+            LockScanWarningKind::HandleEnumeration,
+            "handle probe timed out",
         );
         let result = finish_lock_scan(BTreeMap::new(), vec![warning]);
 
@@ -519,6 +673,25 @@ mod tests {
         assert!(message.contains("Partial lock scan"));
         assert!(message.contains("PID 42"));
         assert!(message.contains("module enumeration"));
+    }
+
+    #[test]
+    fn test_handle_probe_timeout_returns_timeout_outcome() {
+        let result = run_handle_probe_with_timeout(Duration::from_millis(1), || {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(Some("C:\\slow.txt".to_string()))
+        });
+
+        assert_eq!(result, HandleProbeOutcome::TimedOut);
+    }
+
+    #[test]
+    fn test_handle_probe_worker_panic_returns_panic_outcome() {
+        let result = run_handle_probe_with_timeout(Duration::from_secs(1), || {
+            panic!("deliberate handle probe panic");
+        });
+
+        assert_eq!(result, HandleProbeOutcome::WorkerPanicked);
     }
 
     #[test]
