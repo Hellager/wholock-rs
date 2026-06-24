@@ -9,8 +9,6 @@ use std::{
     path::Path,
     ptr::{self, addr_of},
     slice,
-    sync::mpsc::RecvTimeoutError,
-    time::Duration,
 };
 use windows::core::{PCWSTR, PWSTR};
 use windows::Wdk::Foundation::{NtQueryObject, ObjectTypeInformation};
@@ -44,7 +42,6 @@ pub(crate) const PROCESS_ACCESS_RIGHTS_DUP_HANDLE: PROCESS_ACCESS_RIGHTS =
     PROCESS_ACCESS_RIGHTS(0x0040);
 pub(crate) const PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION: PROCESS_ACCESS_RIGHTS =
     PROCESS_ACCESS_RIGHTS(0x0400);
-const DUPLICATE_HANDLE_TIMEOUT: Duration = Duration::from_secs(1);
 const INITIAL_MODULE_CAPACITY: usize = 256;
 
 #[repr(C)]
@@ -194,48 +191,26 @@ pub(crate) fn duplicate_handle_value(
     handle_owner_process: windows::Win32::Foundation::HANDLE,
     source_handle: usize,
 ) -> WholockResult<windows::Win32::Foundation::HANDLE> {
-    let current_process = current_process.0 as usize;
-    let handle_owner_process = handle_owner_process.0 as usize;
-    let (tx, rx) = std::sync::mpsc::channel();
-
-    std::thread::spawn(move || {
-        match duplicate_handle_blocking(current_process, handle_owner_process, source_handle) {
-            Ok(handle) => {
-                if tx.send(Ok(handle)).is_err() {
-                    close_raw_handle(handle);
-                }
-            }
-            Err(err) => {
-                let _ = tx.send(Err(err));
-            }
-        }
-    });
-
-    match rx.recv_timeout(DUPLICATE_HANDLE_TIMEOUT) {
-        Ok(result) => {
-            result.map(|handle| windows::Win32::Foundation::HANDLE(handle as *mut c_void))
-        }
-        Err(RecvTimeoutError::Timeout) => Err(WholockError::HandleError(
-            "Timed out while duplicating handle".to_string(),
-        )),
-        Err(RecvTimeoutError::Disconnected) => Err(WholockError::HandleError(
-            "Handle duplication worker disconnected".to_string(),
-        )),
-    }
+    duplicate_handle_blocking(current_process, handle_owner_process, source_handle)
 }
 
 fn duplicate_handle_blocking(
-    current_process: usize,
-    handle_owner_process: usize,
+    current_process: windows::Win32::Foundation::HANDLE,
+    handle_owner_process: windows::Win32::Foundation::HANDLE,
     source_handle: usize,
-) -> WholockResult<usize> {
+) -> WholockResult<windows::Win32::Foundation::HANDLE> {
     let mut target_handle: windows::Win32::Foundation::HANDLE =
         windows::Win32::Foundation::HANDLE(ptr::null_mut());
+
+    // SAFETY: `current_process` and `handle_owner_process` are live process handles
+    // owned by the caller for the duration of this synchronous call. `source_handle`
+    // is a handle value in `handle_owner_process`; invalid or inaccessible values are
+    // reported by DuplicateHandle and converted to WholockError below.
     let result = unsafe {
         DuplicateHandle(
-            windows::Win32::Foundation::HANDLE(handle_owner_process as *mut c_void),
+            handle_owner_process,
             windows::Win32::Foundation::HANDLE(source_handle as *mut c_void),
-            windows::Win32::Foundation::HANDLE(current_process as *mut c_void),
+            current_process,
             &mut target_handle,
             0,
             false,
@@ -244,17 +219,11 @@ fn duplicate_handle_blocking(
     };
 
     match result {
-        Ok(_) => Ok(target_handle.0 as usize),
+        Ok(_) => Ok(target_handle),
         Err(_) => {
             let err = unsafe { windows::Win32::Foundation::GetLastError() };
             Err(WholockError::Win32Error(err))
         }
-    }
-}
-
-fn close_raw_handle(handle: usize) {
-    unsafe {
-        let _ = CloseHandle(windows::Win32::Foundation::HANDLE(handle as *mut c_void));
     }
 }
 
