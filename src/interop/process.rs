@@ -79,7 +79,7 @@ pub(crate) fn get_process_info(pid: u32) -> WholockResult<(String, String)> {
 
 fn module_count_from_needed_bytes(needed: u32) -> usize {
     let module_size = mem::size_of::<HMODULE>();
-    (needed as usize + module_size - 1) / module_size
+    (needed as usize).div_ceil(module_size)
 }
 
 pub(crate) fn get_process_module_paths(pid: u32) -> WholockResult<Vec<String>> {

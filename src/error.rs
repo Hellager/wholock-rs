@@ -99,7 +99,6 @@ impl Win32Error {
         Self { code }
     }
 
-    #[must_use]
     pub fn code(&self) -> WIN32_ERROR {
         self.code
     }

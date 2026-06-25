@@ -92,7 +92,6 @@ impl Drop for SafeHandle {
 mod tests {
     use super::super::nt_handles::{HandleEntry, SystemHandleTableEntryInfoEx};
     use super::*;
-    use std::ffi::c_void;
     use std::fs::File;
     use std::os::windows::io::AsRawHandle;
     use tempfile::tempdir;
@@ -112,7 +111,7 @@ mod tests {
         let entry = HandleEntry(SystemHandleTableEntryInfoEx {
             object: std::ptr::null_mut(),
             unique_process_id: std::process::id() as usize,
-            handle_value: file.as_raw_handle() as *mut c_void,
+            handle_value: file.as_raw_handle(),
             granted_access: 0,
             creator_back_trace_index: 0,
             object_type_index: 0,
