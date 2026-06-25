@@ -1,5 +1,5 @@
-use crate::scan::find_processes_recursive;
-use crate::{WholockResult, types::WaitForUnlockResult};
+use crate::scan::scan_locks;
+use crate::{WholockResult, types::LockScanOptions, types::WaitForUnlockResult};
 use std::time::{Duration, Instant};
 
 const WAIT_FOR_UNLOCK_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -92,7 +92,7 @@ where
     let mut warnings = Vec::new();
 
     loop {
-        let scan = find_processes_recursive(paths.iter().map(String::as_str))?;
+        let scan = scan_locks(paths.iter().map(String::as_str), LockScanOptions::new())?;
         let (remaining_locks, scan_warnings) = scan.into_parts();
         warnings.extend(scan_warnings);
         let elapsed = start.elapsed();

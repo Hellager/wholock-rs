@@ -123,54 +123,6 @@ impl fmt::Display for Win32Error {
 
 impl std::error::Error for Win32Error {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ShellExecuteError {
-    code: usize,
-}
-
-impl ShellExecuteError {
-    pub(crate) fn new(code: usize) -> Self {
-        Self { code }
-    }
-
-    #[must_use]
-    pub fn code(&self) -> usize {
-        self.code
-    }
-
-    #[must_use]
-    pub fn description(&self) -> &'static str {
-        match self.code {
-            0 => "The operating system is out of memory or resources",
-            2 => "The specified file was not found",
-            3 => "The specified path was not found",
-            5 => "Access was denied",
-            8 => "There was not enough memory to complete the operation",
-            26 => "A sharing violation occurred",
-            27 => "The file association is incomplete or invalid",
-            28 => "The DDE transaction timed out",
-            29 => "The DDE transaction failed",
-            30 => "The DDE transaction was busy",
-            31 => "No application is associated with the specified file",
-            32 => "The dynamic-link library was not found",
-            _ => "ShellExecuteW returned a failure code",
-        }
-    }
-}
-
-impl fmt::Display for ShellExecuteError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "ShellExecuteW failed with code {}: {}",
-            self.code,
-            self.description()
-        )
-    }
-}
-
-impl std::error::Error for ShellExecuteError {}
-
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum WholockError {
@@ -200,9 +152,6 @@ pub enum WholockError {
 
     #[error("Permission error: {0}")]
     PermissionError(#[source] MessageError),
-
-    #[error("Failed to start elevated process: {0}")]
-    ElevationStartError(#[source] ShellExecuteError),
 
     #[error("Invalid PID: {0}")]
     InvalidPID(u32),
@@ -245,10 +194,6 @@ impl WholockError {
 
     pub(crate) fn permission(message: impl Into<String>) -> Self {
         Self::PermissionError(MessageError::new(message))
-    }
-
-    pub(crate) fn elevation_start(code: usize) -> Self {
-        Self::ElevationStartError(ShellExecuteError::new(code))
     }
 
     pub(crate) fn other(message: impl Into<String>) -> Self {

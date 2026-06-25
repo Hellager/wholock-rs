@@ -570,8 +570,8 @@ where
 
 /// Identifies all processes that have locked a specified file.
 ///
-/// This is a convenience wrapper around [`find_processes_recursive`] using
-/// [`LockScanOptions::new`].
+/// This is the simple single-path scan API. Use [`scan_locks`] when scanning
+/// multiple paths or customizing scan behavior with [`LockScanOptions`].
 ///
 /// # Arguments
 ///
@@ -602,90 +602,7 @@ where
 /// }
 /// ```
 pub fn who_locks_file(path: &str) -> WholockResult<LockScanResult> {
-    find_processes_recursive(std::iter::once(path))
-}
-
-/// Identifies all processes that have locked any of the specified files or directories.
-///
-/// Directory inputs are matched recursively, so files and loaded modules underneath a
-/// requested directory are included in the result. Empty, malformed, inaccessible, or
-/// missing paths return [`WholockError::PathError`].
-///
-/// # Arguments
-///
-/// * `paths` - The file and directory paths to check, each as a string-like value
-///
-/// # Returns
-///
-/// Returns `WholockResult<LockScanResult>` containing every process that matched at
-/// least one requested path plus recoverable scan warnings.
-///
-/// # Errors
-///
-/// Returns a `WholockError` if any path is invalid or another hard error occurs.
-///
-/// # Examples
-///
-/// ```no_run
-/// use wholock::who_locks_files;
-///
-/// let scan = who_locks_files([
-///     "C:\\path\\to\\file.txt",
-///     "C:\\path\\to\\directory",
-/// ])?;
-///
-/// for process in scan.processes() {
-///     println!("{} locks {:?}", process.process_name, process.locked_file);
-/// }
-/// # Ok::<(), wholock::error::WholockError>(())
-/// ```
-pub fn who_locks_files<I, P>(paths: I) -> WholockResult<LockScanResult>
-where
-    I: IntoIterator<Item = P>,
-    P: AsRef<str>,
-{
-    find_processes_recursive(paths)
-}
-
-/// Identifies all processes that have locked any of the specified files or directories.
-///
-/// This mirrors PowerToys File Locksmith's recursive multi-path query shape.
-/// Directory inputs are matched recursively, and all paths are checked during one
-/// system handle/module scan. Empty, malformed, inaccessible, or missing paths
-/// return [`WholockError::PathError`].
-///
-/// # Arguments
-///
-/// * `paths` - The file and directory paths to scan recursively
-///
-/// # Returns
-///
-/// Returns `WholockResult<LockScanResult>` containing information about all matching
-/// lock holders and recoverable warnings. Directory inputs match files and loaded
-/// modules below that directory.
-///
-/// # Errors
-///
-/// Returns a `WholockError` if path validation fails or another hard error occurs.
-///
-/// # Examples
-///
-/// ```no_run
-/// use wholock::find_processes_recursive;
-///
-/// let scan = find_processes_recursive(vec!["C:\\work", "C:\\data\\locked.txt"])?;
-///
-/// for process in scan.processes() {
-///     println!("PID {}: {}", process.pid, process.process_name);
-/// }
-/// # Ok::<(), wholock::error::WholockError>(())
-/// ```
-pub fn find_processes_recursive<I, P>(paths: I) -> WholockResult<LockScanResult>
-where
-    I: IntoIterator<Item = P>,
-    P: AsRef<str>,
-{
-    scan_locks(paths, LockScanOptions::new())
+    scan_locks(std::iter::once(path), LockScanOptions::new())
 }
 
 #[cfg(test)]
@@ -702,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_processes_recursive_missing_paths_returns_error() {
+    fn test_scan_locks_missing_paths_returns_error() {
         let dir = tempdir().unwrap();
         let paths = [
             dir.path().join("missing-a.txt"),
@@ -714,23 +631,23 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(matches!(
-            find_processes_recursive(paths),
+            scan_locks(paths, LockScanOptions::new()),
             Err(WholockError::PathError(_))
         ));
     }
 
     #[test]
-    fn test_find_processes_recursive_empty_path_returns_error() {
+    fn test_scan_locks_empty_path_returns_error() {
         assert!(matches!(
-            find_processes_recursive(std::iter::once("")),
+            scan_locks(std::iter::once(""), LockScanOptions::new()),
             Err(WholockError::PathError(_))
         ));
     }
 
     #[test]
-    fn test_find_processes_recursive_nul_path_returns_error() {
+    fn test_scan_locks_nul_path_returns_error() {
         assert!(matches!(
-            find_processes_recursive(std::iter::once("C:\\bad\0path")),
+            scan_locks(std::iter::once("C:\\bad\0path"), LockScanOptions::new()),
             Err(WholockError::PathError(_))
         ));
     }

@@ -37,6 +37,8 @@ wholock = "0.1.0"
 
 ### 基础锁检测
 
+常见场景优先使用 `who_locks_file`：单个路径，默认 best-effort 扫描。
+
 ```rust
 use wholock::{who_locks_file, WholockError};
 
@@ -54,41 +56,46 @@ fn main() -> Result<(), WholockError> {
 }
 ```
 
-### 安全进程终止
+### 高级用法
+
+当需要扫描多个路径或自定义扫描行为时，使用 `scan_locks`。
 
 ```rust
-use wholock::{unlock_file, WholockError};
+use std::time::Duration;
+use wholock::{scan_locks, LockScanOptions, WholockError};
 
-fn release_lock(pid: u32) -> Result<(), WholockError> {
-    match unlock_file(pid) {
-        Ok(_) => println!("✅ 成功终止进程 PID {}", pid),
-        Err(e) => eprintln!("❌ 进程终止错误: {}", e),
+fn main() -> Result<(), WholockError> {
+    let options = LockScanOptions::new()
+        .with_handle_probe_timeout(Duration::from_millis(500))
+        .require_debug_privilege();
+
+    let scan = scan_locks([r"C:\work", r"C:\data\database.lock"], options)?;
+
+    for process in scan.processes() {
+        println!("进程 {} (PID: {}) 锁定文件:", process.process_name, process.pid);
+        for file in &process.locked_file {
+            println!("   - {}", file);
+        }
     }
+
+    for warning in scan.warnings() {
+        eprintln!("{} warning: {}", warning.kind(), warning.message());
+    }
+
     Ok(())
 }
 ```
 
-### 高级监控
+### 安全进程终止
 
 ```rust
-use wholock::ProcessInfo;
-use tokio::time::{interval, Duration};
+use wholock::{unlock_process, WholockError};
 
-async fn monitor_locks(path: &str) -> wholock::WholockResult<()> {
-    let mut interval = interval(Duration::from_secs(30));
-
-    loop {
-        interval.tick().await;
-        let scan = who_locks_file(path)?;
-    
-        if !scan.processes().is_empty() {
-            send_alert(scan.processes()).await?;
-        }
+fn release_lock(pid: u32) -> Result<(), WholockError> {
+    match unlock_process(pid) {
+        Ok(_) => println!("✅ 成功终止进程 PID {}", pid),
+        Err(e) => eprintln!("❌ 进程终止错误: {}", e),
     }
-}
-
-async fn send_alert(processes: &[ProcessInfo]) -> wholock::WholockResult<()> {
-    // 实现自定义通知逻辑
     Ok(())
 }
 ```

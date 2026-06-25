@@ -37,6 +37,8 @@ wholock = "0.1.0"
 
 ### Basic Lock Detection
 
+Use `who_locks_file` for the common case: one path, default best-effort scanning.
+
 ```rust
 use wholock::{who_locks_file, WholockError};
 
@@ -54,41 +56,46 @@ fn main() -> Result<(), WholockError> {
 }
 ```
 
-### Safe Process Termination
+### Advanced Usage
+
+Use `scan_locks` when you need to scan multiple paths or customize scan behavior.
 
 ```rust
-use wholock::{unlock_file, WholockError};
+use std::time::Duration;
+use wholock::{scan_locks, LockScanOptions, WholockError};
 
-fn release_lock(pid: u32) -> Result<(), WholockError> {
-    match unlock_file(pid) {
-        Ok(_) => println!("✅ Successfully terminated PID {}", pid),
-        Err(e) => eprintln!("❌ Error terminating process: {}", e),
+fn main() -> Result<(), WholockError> {
+    let options = LockScanOptions::new()
+        .with_handle_probe_timeout(Duration::from_millis(500))
+        .require_debug_privilege();
+
+    let scan = scan_locks([r"C:\work", r"C:\data\database.lock"], options)?;
+
+    for process in scan.processes() {
+        println!("Process {} (PID: {}) locks:", process.process_name, process.pid);
+        for file in &process.locked_file {
+            println!("   - {}", file);
+        }
     }
+
+    for warning in scan.warnings() {
+        eprintln!("{} warning: {}", warning.kind(), warning.message());
+    }
+
     Ok(())
 }
 ```
 
-### Advanced Monitoring
+### Safe Process Termination
 
 ```rust
-use wholock::ProcessInfo;
-use tokio::time::{interval, Duration};
+use wholock::{unlock_process, WholockError};
 
-async fn monitor_locks(path: &str) -> wholock::WholockResult<()> {
-    let mut interval = interval(Duration::from_secs(30));
-  
-    loop {
-        interval.tick().await;
-        let scan = who_locks_file(path)?;
-      
-        if !scan.processes().is_empty() {
-            send_alert(scan.processes()).await?;
-        }
+fn release_lock(pid: u32) -> Result<(), WholockError> {
+    match unlock_process(pid) {
+        Ok(_) => println!("✅ Successfully terminated PID {}", pid),
+        Err(e) => eprintln!("❌ Error terminating process: {}", e),
     }
-}
-
-async fn send_alert(processes: &[ProcessInfo]) -> wholock::WholockResult<()> {
-    // Implement custom notification logic
     Ok(())
 }
 ```

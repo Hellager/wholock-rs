@@ -6,9 +6,8 @@ use std::time::Duration;
 
 /// Describes a process that currently holds one or more matching file locks.
 ///
-/// Values are returned by [`who_locks_file`](crate::who_locks_file),
-/// [`who_locks_files`](crate::who_locks_files), and
-/// [`find_processes_recursive`](crate::find_processes_recursive).
+/// Values are returned by [`who_locks_file`](crate::who_locks_file) and
+/// [`scan_locks`](crate::scan_locks).
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
     /// Process identifier reported by Windows.

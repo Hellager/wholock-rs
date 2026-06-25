@@ -2,9 +2,10 @@ use crate::WholockResult;
 use crate::error::WholockError;
 use crate::interop::get_process_info;
 use crate::scan::HandleWrapper;
-use crate::scan::find_processes_recursive;
+use crate::scan::scan_locks;
 use crate::types::{
-    ProcessInfo, ProcessTerminationFailure, ProcessTerminationFailureKind, UnlockProcessResult,
+    LockScanOptions, ProcessInfo, ProcessTerminationFailure, ProcessTerminationFailureKind,
+    UnlockProcessResult,
 };
 use std::collections::BTreeSet;
 use windows::Win32::System::Threading::{OpenProcess, TerminateProcess};
@@ -147,12 +148,15 @@ fn process_still_holds_snapshot_locks(
         });
     }
 
-    let current_locks = find_processes_recursive(process.locked_file.iter().map(String::as_str))
-        .map_err(|err| ProcessTerminationFailure {
-            pid: process.pid,
-            kind: ProcessTerminationFailureKind::LockVerification,
-            reason: err.to_string(),
-        })?;
+    let current_locks = scan_locks(
+        process.locked_file.iter().map(String::as_str),
+        LockScanOptions::new(),
+    )
+    .map_err(|err| ProcessTerminationFailure {
+        pid: process.pid,
+        kind: ProcessTerminationFailureKind::LockVerification,
+        reason: err.to_string(),
+    })?;
 
     if current_locks
         .processes()
@@ -256,20 +260,20 @@ fn terminate_process_by_pid(pid: u32) -> WholockResult<()> {
 /// # Examples
 ///
 /// ```no_run
-/// use wholock::{who_locks_file, unlock_file};
+/// use wholock::{unlock_process, who_locks_file};
 ///
 /// // Find processes locking a file
 /// let scan = who_locks_file("C:\\path\\to\\file.txt").unwrap();
 ///
 /// // Terminate the first process found
 /// if let Some(process) = scan.processes().first() {
-///     match unlock_file(process.pid) {
+///     match unlock_process(process.pid) {
 ///         Ok(_) => println!("Successfully terminated process {}", process.pid),
 ///         Err(e) => println!("Failed to terminate process: {:?}", e),
 ///     }
 /// }
 /// ```
-pub fn unlock_file(pid: u32) -> WholockResult<()> {
+pub fn unlock_process(pid: u32) -> WholockResult<()> {
     terminate_process_by_pid(pid)
 }
 
@@ -283,7 +287,7 @@ pub fn unlock_file(pid: u32) -> WholockResult<()> {
 /// # Arguments
 ///
 /// * `processes` - Process lock results, usually returned by [`who_locks_file`](crate::who_locks_file)
-///   or [`who_locks_files`](crate::who_locks_files)
+///   or [`scan_locks`](crate::scan_locks)
 ///
 /// # Returns
 ///
@@ -384,15 +388,15 @@ mod tests {
     }
 
     #[test]
-    fn test_unlock_file_rejects_protected_system_pid() {
-        let result = unlock_file(4);
+    fn test_unlock_process_rejects_protected_system_pid() {
+        let result = unlock_process(4);
 
         assert!(matches!(result, Err(WholockError::PermissionError(_))));
     }
 
     #[test]
-    fn test_unlock_file_rejects_current_process() {
-        let result = unlock_file(std::process::id());
+    fn test_unlock_process_rejects_current_process() {
+        let result = unlock_process(std::process::id());
 
         assert!(matches!(result, Err(WholockError::PermissionError(_))));
     }
