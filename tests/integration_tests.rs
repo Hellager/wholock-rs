@@ -52,7 +52,7 @@ fn e2e_lock_helper_process() {
     thread::sleep(Duration::from_secs(30));
 }
 
-#[test_log::test]
+#[test]
 fn test_find_locked_file_by_helper_process() {
     let (dir, file_path, file) = create_locked_file();
     drop(file);
@@ -102,7 +102,7 @@ fn test_find_locked_file_by_helper_process() {
     drop(dir);
 }
 
-#[test_log::test]
+#[test]
 fn test_no_locks_on_new_file() {
     let (dir, file_path, file) = create_locked_file();
 

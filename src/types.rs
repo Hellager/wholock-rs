@@ -2,7 +2,6 @@ use crate::{
     WholockResult,
     error::{LockScanWarning, WholockError},
 };
-use serde::Serialize;
 use std::time::Duration;
 
 /// Describes a process that currently holds one or more matching file locks.
@@ -10,7 +9,7 @@ use std::time::Duration;
 /// Values are returned by [`who_locks_file`](crate::who_locks_file),
 /// [`who_locks_files`](crate::who_locks_files), and
 /// [`find_processes_recursive`](crate::find_processes_recursive).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct ProcessInfo {
     /// Process identifier reported by Windows.
     pub pid: u32,

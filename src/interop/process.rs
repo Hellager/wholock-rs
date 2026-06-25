@@ -138,7 +138,7 @@ pub(crate) fn get_process_module_paths(pid: u32) -> WholockResult<Vec<String>> {
         let mut paths = Vec::new();
         for module in modules {
             let mut buffer = vec![0u16; MAX_PATH as usize + 1];
-            let len = GetModuleFileNameExW(safe_handle.as_raw(), module, &mut buffer);
+            let len = GetModuleFileNameExW(Some(safe_handle.as_raw()), Some(module), &mut buffer);
             if len == 0 {
                 continue;
             }
@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(module_count_from_needed_bytes(module_size * 3 + 1), 4);
     }
 
-    #[test_log::test]
+    #[test]
     fn test_current_process() {
         let pid = std::process::id();
         let (name, path) = get_process_info(pid).unwrap();
@@ -217,7 +217,7 @@ mod tests {
         );
     }
 
-    #[test_log::test]
+    #[test]
     fn test_current_process_modules() {
         let modules = get_process_module_paths(std::process::id()).unwrap();
 
@@ -229,7 +229,7 @@ mod tests {
         );
     }
 
-    #[test_log::test]
+    #[test]
     fn test_missing_process_modules_returns_error() {
         let result = get_process_module_paths(u32::MAX);
 

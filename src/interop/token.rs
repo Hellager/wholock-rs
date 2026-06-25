@@ -77,9 +77,9 @@ pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
         let lookup_probe = LookupAccountSidW(
             PCWSTR::null(),
             sid,
-            PWSTR::null(),
+            Some(PWSTR::null()),
             &mut name_size,
-            PWSTR::null(),
+            Some(PWSTR::null()),
             &mut domain_size,
             &mut sid_type,
         );
@@ -100,9 +100,9 @@ pub(crate) fn get_handle_owner_info(handle: HANDLE) -> WholockResult<String> {
         if LookupAccountSidW(
             PCWSTR::null(),
             sid,
-            PWSTR::from_raw(name.as_mut_ptr()),
+            Some(PWSTR::from_raw(name.as_mut_ptr())),
             &mut name_size,
-            PWSTR::from_raw(domain.as_mut_ptr()),
+            Some(PWSTR::from_raw(domain.as_mut_ptr())),
             &mut domain_size,
             &mut sid_type,
         )

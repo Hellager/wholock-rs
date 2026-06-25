@@ -151,7 +151,7 @@ pub fn start_as_elevated() -> WholockResult<()> {
     // because no owner window or working directory override is required.
     let result = unsafe {
         ShellExecuteW(
-            HWND::default(),
+            Some(HWND::default()),
             PCWSTR(operation.as_ptr()),
             PCWSTR(file.as_ptr()),
             parameters,

@@ -1,8 +1,6 @@
-use crate::{WholockResult, error::WholockError, error::get_win32_error_message};
+use crate::{WholockResult, error::WholockError};
 use std::{ffi::c_void, ptr};
-use windows::Win32::Foundation::{
-    CloseHandle, DUPLICATE_HANDLE_OPTIONS, DuplicateHandle, HANDLE, WIN32_ERROR,
-};
+use windows::Win32::Foundation::{CloseHandle, DUPLICATE_HANDLE_OPTIONS, DuplicateHandle, HANDLE};
 
 #[cfg(test)]
 use super::nt_handles::HandleEntry;
@@ -84,12 +82,7 @@ impl Drop for SafeHandle {
             // SAFETY: SafeHandle owns this handle and Drop is the single cleanup
             // path. Invalid handles are filtered out before CloseHandle.
             unsafe {
-                if let Err(e) = CloseHandle(self.0) {
-                    log::error!(
-                        "Failed to close handle: {}",
-                        get_win32_error_message(&WIN32_ERROR(e.code().0 as u32))
-                    );
-                }
+                let _ = CloseHandle(self.0);
             }
         }
     }

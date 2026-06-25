@@ -50,9 +50,6 @@ impl HandleEntry {
     pub fn unique_process_id(&self) -> usize {
         self.0.unique_process_id
     }
-    fn handle_value(&self) -> *mut c_void {
-        self.0.handle_value
-    }
     pub(crate) fn handle_value_raw(&self) -> usize {
         self.0.handle_value as usize
     }
@@ -150,33 +147,6 @@ pub(crate) fn get_handle_table(buffer: &[u8]) -> WholockResult<&[HandleEntry]> {
     // SAFETY: The checks above verify the advertised handle count fits in
     // the returned buffer. `HandleEntry` is repr(transparent) over the NT entry.
     Ok(unsafe { slice::from_raw_parts(table_ptr, len) })
-}
-
-#[allow(dead_code)]
-pub(crate) fn query_system_info() {
-    use log::debug;
-
-    let Ok(buffer) = query_system_information_buffer(SYSTEM_EXTENDED_HANDLE_INFORMATION) else {
-        return;
-    };
-    let Ok(table) = get_handle_table(&buffer) else {
-        return;
-    };
-    for (i, entry) in table.iter().enumerate() {
-        debug!("entry {i}:");
-        debug!("  Object = {:p}", entry.object());
-        debug!("  UniqueProcessId = {}", entry.unique_process_id());
-        debug!("  HandleValue = {:p}", entry.handle_value());
-        debug!("  GrantedAccess = {:#x}", entry.granted_access());
-        debug!(
-            "  CreatorBackTraceIndex = {}",
-            entry.creator_back_trace_index()
-        );
-        debug!("  ObjectTypeIndex = {}", entry.object_type_index());
-        debug!("  HandleAttributes = {:#x}", entry.handle_attributes());
-    }
-
-    debug!("system info");
 }
 
 #[cfg(test)]

@@ -57,7 +57,7 @@ pub(crate) fn final_path_for_path(path: &str) -> WholockResult<String> {
             None,
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS,
-            HANDLE::default(),
+            Some(HANDLE::default()),
         )
     }?;
     let handle = SafeHandle::new(handle)?;

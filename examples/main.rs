@@ -1,15 +1,12 @@
 use std::env;
 use std::time::Duration;
-use wholock::{processes_to_json, unlock_processes, wait_for_unlock, who_locks_file};
+use wholock::{unlock_processes, wait_for_unlock, who_locks_file};
 
 fn main() {
-    env_logger::init();
-
     let mut args = env::args();
     let program = args.next().unwrap_or_else(|| "wholock".to_string());
     let mut file_path = None;
     let mut should_unlock = false;
-    let mut json_output = false;
     let mut wait = false;
     let mut wait_timeout = None;
     let mut args = args.peekable();
@@ -17,7 +14,6 @@ fn main() {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--unlock" => should_unlock = true,
-            "--json" => json_output = true,
             "--wait" => {
                 wait = true;
                 if let Some(next) = args.peek() {
@@ -49,22 +45,18 @@ fn main() {
             _ if file_path.is_none() => file_path = Some(arg),
             _ => {
                 eprintln!("Unexpected argument: {arg}");
-                eprintln!("Usage: {program} <file_path> [--unlock] [--json] [--wait [seconds]]");
+                eprintln!("Usage: {program} <file_path> [--unlock] [--wait [seconds]]");
                 return;
             }
         }
     }
 
     let Some(file_path) = file_path else {
-        println!("Usage: {program} <file_path> [--unlock] [--json] [--wait [seconds]]");
+        println!("Usage: {program} <file_path> [--unlock] [--wait [seconds]]");
         return;
     };
 
     if wait {
-        if json_output {
-            eprintln!("Warning: --wait is incompatible with --json; ignoring --json");
-        }
-
         println!("Waiting for files to be unlocked...");
         match wait_for_unlock(&file_path, wait_timeout) {
             Ok(result) if result.unlocked => {
@@ -88,12 +80,7 @@ fn main() {
 
     match who_locks_file(&file_path) {
         Ok(scan) => {
-            if json_output {
-                match processes_to_json(scan.processes()) {
-                    Ok(json) => println!("{json}"),
-                    Err(e) => eprintln!("Error: {}", e),
-                }
-            } else if scan.processes().is_empty() {
+            if scan.processes().is_empty() {
                 println!("No process is locking the file: {}", file_path);
             } else {
                 println!("\nProcesses locking the file {}:", file_path);
@@ -118,16 +105,9 @@ fn main() {
                         "Attempting to unlock by terminating process {}...",
                         unlock.pid
                     );
-                    if json_output {
-                        eprintln!("{status}");
-                    } else {
-                        println!("{status}");
-                    }
+                    println!("{status}");
 
                     match unlock.result {
-                        Ok(_) if json_output => {
-                            eprintln!("Successfully terminated process {}", unlock.pid)
-                        }
                         Ok(_) => println!("Successfully terminated process {}", unlock.pid),
                         Err(e) => {
                             if let Some(failure) = &unlock.failure {

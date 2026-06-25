@@ -1,7 +1,6 @@
 mod elevation;
 pub mod error;
 mod interop;
-mod json;
 mod scan;
 mod types;
 mod unlock;
@@ -17,7 +16,6 @@ pub type WholockResult<T> = Result<T, WholockError>;
 pub use elevation::{
     enable_debug_privilege, is_process_elevated, restart_as_elevated, start_as_elevated,
 };
-pub use json::processes_to_json;
 pub use scan::{find_processes_recursive, scan_locks, who_locks_file, who_locks_files};
 pub use types::{
     LockScanOptions, LockScanResult, ProcessInfo, ProcessTerminationFailure,

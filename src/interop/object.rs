@@ -31,7 +31,7 @@ pub(crate) fn get_object_type_name(handle: HANDLE) -> WholockResult<String> {
         // is a writable byte buffer and `return_length` is a valid out-parameter.
         let status = unsafe {
             NtQueryObject(
-                handle,
+                Some(handle),
                 ObjectTypeInformation,
                 Some(buffer.as_mut_ptr().cast()),
                 buffer.len() as u32,
