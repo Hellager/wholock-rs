@@ -10,7 +10,7 @@
 
 ## 概述
 
-Windows 文件锁定诊断工具包，精准识别锁定文件的进程并安全释放资源。
+Windows 文件锁定诊断工具包，精准识别锁定文件的进程，并在需要时终止已校验的锁持有者。
 
 本项目是 [File Locksmith](https://github.com/microsoft/PowerToys?tab=readme-ov-file) 的 Rust 实现，当前处于早期开发阶段。
 
@@ -18,7 +18,7 @@ Windows 文件锁定诊断工具包，精准识别锁定文件的进程并安全
 
 - 🔍 **深度句柄探查** - 通过 NTAPI 枚举系统句柄
 - 🎯 **精准 PID 定位** - 将句柄映射到具体进程 ID
-- 🔓 **安全解锁控制** - 带安全检查的优雅终止
+- 🔓 **安全解锁控制** - 带安全检查的受控终止
 - 📂 **路径标准化** - 处理 Win32 设备路径转换
 - 🛡️ **安全 FFI 封装** - Windows 句柄的 RAII 守卫
 
@@ -31,18 +31,19 @@ Windows 文件锁定诊断工具包，精准识别锁定文件的进程并安全
 wholock = "0.1.0"
 ```
 
-*要求 Windows 10+ 和 Rust 1.70+*
+*要求 Windows 10+ 和 Rust 1.85+*
 
 ## 使用指南 🚀
 
-### 基础锁检测
+### 基础锁检测和解锁
 
-常见场景优先使用 `who_locks_file`：单个路径，默认 best-effort 扫描。
+常见场景优先使用 `who_locks_file`：单个路径，默认 best-effort 扫描。需要解锁时，
+将扫描结果传给 `unlock_processes`，由 wholock 在终止前重新校验锁持有者。
 
 ```rust
-use wholock::{who_locks_file, WholockError};
+use wholock::{unlock_processes, who_locks_file, WholockResult};
 
-fn main() -> Result<(), WholockError> {
+fn main() -> WholockResult<()> {
     let target = r"C:\critical\database.lock";
 
     let scan = who_locks_file(target)?;
@@ -51,6 +52,14 @@ fn main() -> Result<(), WholockError> {
         println!("🔒 进程 {} (PID: {}) 锁定文件:", p.process_name, p.pid);
         p.locked_file.iter().for_each(|f| println!("   - {}", f));
     });
+
+    for result in unlock_processes(scan.processes()) {
+        if result.is_success() {
+            println!("✅ 成功终止进程 PID {}", result.pid);
+        } else if let Some(reason) = result.failure_reason() {
+            eprintln!("❌ 无法终止进程 PID {}: {}", result.pid, reason);
+        }
+    }
 
     Ok(())
 }
@@ -62,9 +71,9 @@ fn main() -> Result<(), WholockError> {
 
 ```rust
 use std::time::Duration;
-use wholock::{scan_locks, LockScanOptions, WholockError};
+use wholock::{scan_locks, unlock_processes, LockScanOptions, WholockResult};
 
-fn main() -> Result<(), WholockError> {
+fn main() -> WholockResult<()> {
     let options = LockScanOptions::new()
         .with_handle_probe_timeout(Duration::from_millis(500))
         .require_debug_privilege();
@@ -82,20 +91,14 @@ fn main() -> Result<(), WholockError> {
         eprintln!("{} warning: {}", warning.kind(), warning.message());
     }
 
-    Ok(())
-}
-```
-
-### 安全进程终止
-
-```rust
-use wholock::{unlock_process, WholockError};
-
-fn release_lock(pid: u32) -> Result<(), WholockError> {
-    match unlock_process(pid) {
-        Ok(_) => println!("✅ 成功终止进程 PID {}", pid),
-        Err(e) => eprintln!("❌ 进程终止错误: {}", e),
+    for result in unlock_processes(scan.processes()) {
+        if result.is_success() {
+            println!("✅ 成功终止进程 PID {}", result.pid);
+        } else if let Some(reason) = result.failure_reason() {
+            eprintln!("❌ 无法终止进程 PID {}: {}", result.pid, reason);
+        }
     }
+
     Ok(())
 }
 ```
@@ -103,16 +106,16 @@ fn release_lock(pid: u32) -> Result<(), WholockError> {
 ## 安全说明 🔐
 
 ### 关键要求
-- 🛑 **需要管理员权限** 用于句柄复制
-- ⚠️ **句柄验证** - 反DLL注入保护
+- 🛑 **提权可选** 管理员/debug privilege 可提升扫描完整性
+- ⚠️ **句柄验证** - 探测路径前进行句柄类型检查
 - 🔄 **资源清理保证** - 系统句柄的RAII模式
 
 ### 系统兼容性
 | 组件           | 要求                  |
 |-----------------|-----------------------|
 | 操作系统版本    | Windows 10+          |
-| Rust 工具链     | 1.70+ (最低支持版本) |
-| 安全策略        | 启用 SeDebugPrivilege|
+| Rust 工具链     | 1.85+ (最低支持版本) |
+| 安全策略        | SeDebugPrivilege 可选，用于提升可见性 |
 
 ## 贡献指南 👥
 
@@ -122,11 +125,11 @@ fn release_lock(pid: u32) -> Result<(), WholockError> {
 # 克隆仓库（含子模块）
 git clone --recurse-submodules https://github.com/Hellager/wholock-rs.git
 
-# 使用 Windows SDK 构建
-cargo build --features=win32
+# 构建
+cargo build
 
-# 运行测试（需管理员权限）
-cargo test -- --test-threads=1
+# 运行测试
+cargo test
 ```
 
 ### 代码规范

@@ -10,7 +10,8 @@ Read this in other languages: [English](README.md) | [中文](README.cn.md)
 
 ## Overview
 
-Windows file locking diagnostics toolkit with surgical precision. Identify processes locking files and safely release resources. 
+Windows file locking diagnostics toolkit with surgical precision. Identify processes locking files
+and terminate verified lock holders when requested.
 
 This is basically a Rust implementation of [File Locksmith](https://github.com/microsoft/PowerToys?tab=readme-ov-file) and for now its in a very early version. 
 
@@ -18,7 +19,7 @@ This is basically a Rust implementation of [File Locksmith](https://github.com/m
 
 - 🔍 **Deep Handle Inspection** - Enumerate system handles with NTAPI
 - 🎯 **Precise PID Targeting** - Map handles to exact process IDs
-- 🔓 **Controlled Unlocking** - Graceful termination with safety checks
+- 🔓 **Controlled Unlocking** - Checked termination with safety checks
 - 📂 **Path Normalization** - Handle Win32 device path conversions
 - 🛡️ **Safe FFI Wrapping** - RAII guards for Windows handles
 
@@ -31,18 +32,20 @@ Add to `Cargo.toml`:
 wholock = "0.1.0"
 ```
 
-*Requires Windows 10+ and Rust 1.70+*
+*Requires Windows 10+ and Rust 1.85+*
 
 ## Usage Guide 🚀
 
-### Basic Lock Detection
+### Basic Lock Detection and Unlocking
 
-Use `who_locks_file` for the common case: one path, default best-effort scanning.
+Use `who_locks_file` for the common case: one path, default best-effort scanning. Pass the scan
+result to `unlock_processes` when you want wholock to revalidate the lock holders before
+termination.
 
 ```rust
-use wholock::{who_locks_file, WholockError};
+use wholock::{unlock_processes, who_locks_file, WholockResult};
 
-fn main() -> Result<(), WholockError> {
+fn main() -> WholockResult<()> {
     let target = r"C:\critical\database.lock";
   
     let scan = who_locks_file(target)?;
@@ -51,6 +54,14 @@ fn main() -> Result<(), WholockError> {
         println!("🔒 Process {} (PID: {}) locks:", p.process_name, p.pid);
         p.locked_file.iter().for_each(|f| println!("   - {}", f));
     });
+
+    for result in unlock_processes(scan.processes()) {
+        if result.is_success() {
+            println!("✅ Successfully terminated PID {}", result.pid);
+        } else if let Some(reason) = result.failure_reason() {
+            eprintln!("❌ Failed to terminate PID {}: {}", result.pid, reason);
+        }
+    }
   
     Ok(())
 }
@@ -62,9 +73,9 @@ Use `scan_locks` when you need to scan multiple paths or customize scan behavior
 
 ```rust
 use std::time::Duration;
-use wholock::{scan_locks, LockScanOptions, WholockError};
+use wholock::{scan_locks, unlock_processes, LockScanOptions, WholockResult};
 
-fn main() -> Result<(), WholockError> {
+fn main() -> WholockResult<()> {
     let options = LockScanOptions::new()
         .with_handle_probe_timeout(Duration::from_millis(500))
         .require_debug_privilege();
@@ -82,20 +93,14 @@ fn main() -> Result<(), WholockError> {
         eprintln!("{} warning: {}", warning.kind(), warning.message());
     }
 
-    Ok(())
-}
-```
-
-### Safe Process Termination
-
-```rust
-use wholock::{unlock_process, WholockError};
-
-fn release_lock(pid: u32) -> Result<(), WholockError> {
-    match unlock_process(pid) {
-        Ok(_) => println!("✅ Successfully terminated PID {}", pid),
-        Err(e) => eprintln!("❌ Error terminating process: {}", e),
+    for result in unlock_processes(scan.processes()) {
+        if result.is_success() {
+            println!("✅ Successfully terminated PID {}", result.pid);
+        } else if let Some(reason) = result.failure_reason() {
+            eprintln!("❌ Failed to terminate PID {}: {}", result.pid, reason);
+        }
     }
+
     Ok(())
 }
 ```
@@ -103,16 +108,16 @@ fn release_lock(pid: u32) -> Result<(), WholockError> {
 ## Security Notes 🔐
 
 ### Critical Requirements
-- 🛑 **Admin Privileges** Required for handle duplication
-- ⚠️ **Handle Validation** - Anti-DLL injection protections
+- 🛑 **Elevation Optional** - Administrator/debug privilege improves scan completeness
+- ⚠️ **Handle Validation** - Handle type checks before path probing
 - 🔄 **Cleanup Guarantees** - RAII pattern for system handles
 
 ### System Compatibility
 | Component       | Requirement              |
 |-----------------|--------------------------|
 | OS Version      | Windows 10+             |
-| Rust Toolchain  | 1.70+ (MSRV)            |
-| Security Policy | SeDebugPrivilege enabled|
+| Rust Toolchain  | 1.85+ (MSRV)            |
+| Security Policy | SeDebugPrivilege optional for fuller visibility |
 
 ## Contribution 👥
 
@@ -122,11 +127,11 @@ fn release_lock(pid: u32) -> Result<(), WholockError> {
 # Clone with submodules
 git clone --recurse-submodules https://github.com/Hellager/wholock-rs.git
 
-# Build with Windows SDK
-cargo build --features=win32
+# Build
+cargo build
 
-# Run tests (admin required)
-cargo test -- --test-threads=1
+# Run tests
+cargo test
 ```
 
 ### Code Standards

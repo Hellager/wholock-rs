@@ -25,7 +25,7 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use wholock::{WholockResult, who_locks_file};
+//! use wholock::{WholockResult, unlock_processes, who_locks_file};
 //!
 //! fn main() -> WholockResult<()> {
 //!     let scan = who_locks_file("C:\\path\\to\\file.txt")?;
@@ -34,6 +34,14 @@
 //!         println!("PID {}: {}", process.pid, process.process_name);
 //!         for path in &process.locked_file {
 //!             println!("  - {}", path);
+//!         }
+//!     }
+//!
+//!     for result in unlock_processes(scan.processes()) {
+//!         if result.is_success() {
+//!             println!("terminated PID {}", result.pid);
+//!         } else if let Some(reason) = result.failure_reason() {
+//!             eprintln!("failed to terminate PID {}: {}", result.pid, reason);
 //!         }
 //!     }
 //!
@@ -51,7 +59,7 @@
 //!
 //! ```rust,no_run
 //! use std::time::Duration;
-//! use wholock::{LockScanOptions, WholockResult, scan_locks};
+//! use wholock::{LockScanOptions, WholockResult, scan_locks, unlock_processes};
 //!
 //! fn main() -> WholockResult<()> {
 //!     let options = LockScanOptions::new()
@@ -62,6 +70,16 @@
 //!
 //!     for warning in scan.warnings() {
 //!         eprintln!("{} warning: {}", warning.kind(), warning.message());
+//!     }
+//!
+//!     for result in unlock_processes(scan.processes()) {
+//!         if !result.is_success() {
+//!             eprintln!(
+//!                 "failed to terminate PID {}: {}",
+//!                 result.pid,
+//!                 result.failure_reason().unwrap_or("unknown failure")
+//!             );
+//!         }
 //!     }
 //!
 //!     Ok(())
