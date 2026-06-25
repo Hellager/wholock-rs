@@ -29,7 +29,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-wholock = "0.1.0"
+wholock = "0.1.1"
 ```
 
 *Requires Windows 10+ and Rust 1.85+*
