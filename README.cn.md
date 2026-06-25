@@ -12,7 +12,8 @@
 
 Windows 文件锁定诊断工具包，精准识别锁定文件的进程，并在需要时终止已校验的锁持有者。
 
-本项目是 [File Locksmith](https://github.com/microsoft/PowerToys?tab=readme-ov-file) 的 Rust 实现，当前处于早期开发阶段。
+本项目受 PowerToys [File Locksmith](https://github.com/microsoft/PowerToys?tab=readme-ov-file)
+启发，为文件锁发现和受控解锁提供专注的 Rust 库 API。
 
 ## 功能特性 ✨
 

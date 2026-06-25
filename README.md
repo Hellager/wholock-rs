@@ -13,7 +13,8 @@ Read this in other languages: [English](README.md) | [中文](README.cn.md)
 Windows file locking diagnostics toolkit with surgical precision. Identify processes locking files
 and terminate verified lock holders when requested.
 
-This is basically a Rust implementation of [File Locksmith](https://github.com/microsoft/PowerToys?tab=readme-ov-file) and for now its in a very early version. 
+Inspired by PowerToys [File Locksmith](https://github.com/microsoft/PowerToys?tab=readme-ov-file),
+`wholock` provides a focused Rust library API for lock discovery and controlled unlocking.
 
 ## Features ✨
 
