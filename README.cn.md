@@ -89,7 +89,7 @@ fn main() -> WholockResult<()> {
     }
 
     for warning in scan.warnings() {
-        eprintln!("{} warning: {}", warning.kind(), warning.message());
+        eprintln!("{warning}");
     }
 
     for result in unlock_processes(scan.processes()) {

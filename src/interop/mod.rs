@@ -13,7 +13,7 @@ pub(crate) use nt_handles::{
     PROCESS_ACCESS_RIGHTS_DUP_HANDLE, PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
     SYSTEM_EXTENDED_HANDLE_INFORMATION, get_handle_table, query_system_information_buffer,
 };
-pub(crate) use object::is_file_handle;
+pub(crate) use object::is_disk_file_handle;
 pub(crate) use path_matcher::LockedPathMatchers;
 pub(crate) use path_matcher::kernel_path_for_path;
 pub(crate) use process::{get_process_info, get_process_module_paths};

@@ -2,6 +2,7 @@ use crate::WholockResult;
 use std::{ffi::OsString, mem, os::windows::ffi::OsStringExt, slice};
 use windows::Wdk::Foundation::{NtQueryObject, OBJECT_INFORMATION_CLASS, ObjectTypeInformation};
 use windows::Win32::Foundation::{HANDLE, UNICODE_STRING, WIN32_ERROR};
+use windows::Win32::Storage::FileSystem::{FILE_TYPE_DISK, GetFileType};
 
 #[repr(C)]
 struct ObjectTypeInformationPrefix {
@@ -99,6 +100,16 @@ pub(crate) fn is_file_handle(handle: HANDLE) -> bool {
     get_object_type_name(handle).is_ok_and(|type_name| type_name == "File")
 }
 
+pub(crate) fn is_disk_file_handle(handle: HANDLE) -> bool {
+    if !is_file_handle(handle) {
+        return false;
+    }
+
+    // SAFETY: `handle` is supplied by the caller as a live duplicated handle.
+    // GetFileType only inspects the handle and does not take ownership of it.
+    unsafe { GetFileType(handle) == FILE_TYPE_DISK }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +129,7 @@ mod tests {
 
         assert_eq!(get_object_type_name(handle).unwrap(), "File");
         assert!(is_file_handle(handle));
+        assert!(is_disk_file_handle(handle));
     }
 
     #[test]

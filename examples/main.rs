@@ -99,6 +99,10 @@ fn main() {
                 }
             }
 
+            for warning in scan.warnings() {
+                eprintln!("Warning: {warning}");
+            }
+
             if should_unlock {
                 for unlock in unlock_processes(scan.processes()) {
                     let status = format!(

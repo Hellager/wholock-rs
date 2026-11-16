@@ -1,10 +1,10 @@
 use crate::elevation::enable_debug_privilege;
-use crate::error::{LockScanWarning, LockScanWarningKind, WholockError};
+use crate::error::{LockScanWarning, LockScanWarningKind, WholockError, get_win32_error_message};
 use crate::interop::{
     LockedPathMatchers, PROCESS_ACCESS_RIGHTS_DUP_HANDLE, PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
     ResolvedFilePath, SYSTEM_EXTENDED_HANDLE_INFORMATION, duplicate_handle_value,
     get_file_paths_by_handle, get_handle_owner_info, get_handle_table, get_process_info,
-    get_process_module_paths, is_file_handle, kernel_path_for_path,
+    get_process_module_paths, is_disk_file_handle, kernel_path_for_path,
     query_system_information_buffer,
 };
 use crate::{
@@ -61,6 +61,7 @@ enum HandleProbeOutcome {
     WorkerDisconnected,
     WorkerPanicked,
     SpawnFailed(String),
+    ProbeFailed(String),
 }
 
 type HandleProbeFunction =
@@ -162,7 +163,8 @@ impl HandleProbeWorker {
 
         match result.recv_timeout(timeout) {
             Ok(Ok(Ok(Some(path)))) => HandleProbeOutcome::Path(path),
-            Ok(Ok(Ok(None) | Err(_))) => HandleProbeOutcome::NoMatch,
+            Ok(Ok(Ok(None))) => HandleProbeOutcome::NoMatch,
+            Ok(Ok(Err(error))) => HandleProbeOutcome::ProbeFailed(error.to_string()),
             Ok(Err(_)) => HandleProbeOutcome::WorkerPanicked,
             Err(RecvTimeoutError::Timeout) => {
                 self.sender = None;
@@ -203,16 +205,15 @@ fn probe_handle_path_blocking(
         return Ok(None);
     }
 
-    if !is_file_handle(dup_handle.get()) {
+    if !is_disk_file_handle(dup_handle.get()) {
         return Ok(None);
     }
 
-    Ok(get_file_paths_by_handle(&dup_handle.get()).ok())
+    get_file_paths_by_handle(&dup_handle.get()).map(Some)
 }
 
 struct ProcessLockCollector {
     pid: u32,
-    domain_username: Option<String>,
     locked_files: BTreeSet<String>,
 }
 
@@ -220,30 +221,39 @@ impl ProcessLockCollector {
     fn new(pid: u32) -> Self {
         Self {
             pid,
-            domain_username: None,
             locked_files: BTreeSet::new(),
         }
     }
 
-    fn with_locked_files(
-        pid: u32,
-        domain_username: Option<String>,
-        locked_files: BTreeSet<String>,
-    ) -> Self {
-        Self {
-            pid,
-            domain_username,
-            locked_files,
-        }
+    fn with_locked_files(pid: u32, locked_files: BTreeSet<String>) -> Self {
+        Self { pid, locked_files }
     }
 
     fn insert_path(&mut self, path: String) {
         self.locked_files.insert(path);
     }
 
-    fn into_process_info(self) -> ProcessInfo {
-        let domain_username = self.domain_username.unwrap_or_default();
-        let (process_name, process_exe_path) = get_process_info(self.pid).unwrap_or_default();
+    fn into_process_info(self, warnings: &mut Vec<LockScanWarning>) -> ProcessInfo {
+        let domain_username = match get_process_owner_info(self.pid) {
+            Ok(username) => username,
+            Err(err) => {
+                warnings.push(process_metadata_warning(
+                    self.pid,
+                    format!("failed to query process owner: {err}"),
+                ));
+                String::new()
+            }
+        };
+        let (process_name, process_exe_path) = match get_process_info(self.pid) {
+            Ok(info) => info,
+            Err(err) => {
+                warnings.push(process_metadata_warning(
+                    self.pid,
+                    format!("failed to query process image metadata: {err}"),
+                ));
+                (String::new(), String::new())
+            }
+        };
 
         ProcessInfo {
             pid: self.pid,
@@ -275,35 +285,60 @@ fn collect_handle_locks_parallel(
     let queue = Arc::new(Mutex::new(VecDeque::from(handle_groups)));
     let (tx, rx) = std::sync::mpsc::channel();
     let mut workers = Vec::with_capacity(worker_count);
+    let mut startup_warnings = Vec::new();
 
-    for _ in 0..worker_count {
+    for worker_index in 0..worker_count {
         let queue = Arc::clone(&queue);
         let tx = tx.clone();
         let matchers = Arc::clone(&matchers);
-        workers.push(std::thread::spawn(move || {
-            let mut probe_worker = HandleProbeWorker::new(probe_handle_path_blocking);
-            loop {
-                let task = queue.lock().ok().and_then(|mut queue| queue.pop_front());
-                let Some((pid, handle_values)) = task else {
-                    break;
-                };
+        let worker = std::thread::Builder::new()
+            .name(format!("wholock-handle-scan-{worker_index}"))
+            .spawn(move || {
+                let mut probe_worker = HandleProbeWorker::new(probe_handle_path_blocking);
+                loop {
+                    let task = match queue.lock() {
+                        Ok(mut queue) => queue.pop_front(),
+                        Err(_) => {
+                            let _ = tx.send(ProcessHandleScanResult {
+                                process_info: None,
+                                warnings: vec![LockScanWarning::new(
+                                    None,
+                                    LockScanWarningKind::HandleEnumeration,
+                                    "handle scan work queue was poisoned",
+                                )],
+                            });
+                            break;
+                        }
+                    };
+                    let Some((pid, handle_values)) = task else {
+                        break;
+                    };
 
-                let scan_result = scan_process_handles(
-                    pid,
-                    &handle_values,
-                    &matchers,
-                    handle_probe_timeout,
-                    &mut probe_worker,
-                );
-                let _ = tx.send(scan_result);
-            }
-        }));
+                    let scan_result = scan_process_handles(
+                        pid,
+                        &handle_values,
+                        &matchers,
+                        handle_probe_timeout,
+                        &mut probe_worker,
+                    );
+                    let _ = tx.send(scan_result);
+                }
+            });
+
+        match worker {
+            Ok(worker) => workers.push(worker),
+            Err(err) => startup_warnings.push(LockScanWarning::new(
+                None,
+                LockScanWarningKind::HandleEnumeration,
+                format!("failed to spawn handle scan worker {worker_index}: {err}"),
+            )),
+        }
     }
 
     drop(tx);
 
     let mut result = BTreeMap::new();
-    let mut warnings = Vec::new();
+    let mut warnings = startup_warnings;
     for process_scan in rx {
         if let Some(process_info) = process_scan.process_info {
             result.insert(process_info.pid, process_info);
@@ -312,7 +347,13 @@ fn collect_handle_locks_parallel(
     }
 
     for worker in workers {
-        let _ = worker.join();
+        if worker.join().is_err() {
+            warnings.push(LockScanWarning::new(
+                None,
+                LockScanWarningKind::HandleEnumeration,
+                "handle scan worker panicked",
+            ));
+        }
     }
 
     (result, warnings)
@@ -337,11 +378,11 @@ impl ProcessHandleScanResult {
 
 fn finish_lock_scan(
     result: BTreeMap<u32, ProcessLockCollector>,
-    warnings: Vec<LockScanWarning>,
+    mut warnings: Vec<LockScanWarning>,
 ) -> LockScanResult {
     let processes = result
         .into_values()
-        .map(ProcessLockCollector::into_process_info)
+        .map(|collector| collector.into_process_info(&mut warnings))
         .collect::<Vec<_>>();
 
     LockScanResult::new(processes, warnings)
@@ -363,13 +404,16 @@ fn scan_process_handles(
 
     let mut locked_files = BTreeSet::new();
     let mut warnings = Vec::new();
+    let mut probe_failures = Vec::new();
+    let mut kernel_path_failures = Vec::new();
 
     for handle_value in handle_values {
         match probe_worker.probe(pid, *handle_value, handle_probe_timeout) {
             HandleProbeOutcome::Path(paths) => {
-                let kernel_path =
-                    (!paths.kernel_path.is_empty()).then_some(paths.kernel_path.as_str());
-                if matchers.matches_resolved(&paths.display_path, kernel_path) {
+                if let Some(error) = paths.kernel_path_error {
+                    kernel_path_failures.push(format!("handle {handle_value:#x}: {error}"));
+                }
+                if matchers.matches_resolved(&paths.display_path, paths.kernel_path.as_deref()) {
                     locked_files.insert(paths.display_path);
                 }
             }
@@ -402,7 +446,41 @@ fn scan_process_handles(
                 LockScanWarningKind::HandleEnumeration,
                 format!("failed to spawn handle probe worker: {message}"),
             )),
+            HandleProbeOutcome::ProbeFailed(message) => {
+                probe_failures.push(format!("handle {handle_value:#x}: {message}"));
+            }
         }
+    }
+
+    if !probe_failures.is_empty() {
+        let details = probe_failures.iter().take(3).join("; ");
+        let suffix = (probe_failures.len() > 3).then_some("; additional failures omitted");
+        warnings.push(LockScanWarning::new(
+            Some(pid),
+            LockScanWarningKind::HandleEnumeration,
+            format!(
+                "failed to resolve {} file handle path(s): {details}{}",
+                probe_failures.len(),
+                suffix.unwrap_or_default()
+            ),
+        ));
+    }
+
+    if !kernel_path_failures.is_empty() {
+        let details = kernel_path_failures.iter().take(3).join("; ");
+        let suffix = if kernel_path_failures.len() > 3 {
+            "; additional failures omitted"
+        } else {
+            ""
+        };
+        warnings.push(LockScanWarning::new(
+            Some(pid),
+            LockScanWarningKind::HandleEnumeration,
+            format!(
+                "failed to resolve NT paths for {} disk handle(s); display-path matching continued: {details}{suffix}",
+                kernel_path_failures.len()
+            ),
+        ));
     }
 
     if locked_files.is_empty() {
@@ -412,9 +490,8 @@ fn scan_process_handles(
         };
     }
 
-    let domain_username = get_process_owner_info(pid).ok();
     ProcessHandleScanResult::with_process_info(
-        ProcessLockCollector::with_locked_files(pid, domain_username, locked_files),
+        ProcessLockCollector::with_locked_files(pid, locked_files),
         warnings,
     )
 }
@@ -423,12 +500,20 @@ fn verify_process_can_be_scanned(pid: u32) -> Result<(), LockScanWarning> {
     // SAFETY: OpenProcess is called with a concrete PID from the system handle
     // table. The returned process HANDLE is used only as a capability preflight
     // and is closed before any timeout-protected worker is spawned.
-    let Ok(handle) = (unsafe { OpenProcess(PROCESS_ACCESS_RIGHTS_DUP_HANDLE, false, pid) }) else {
-        return Err(LockScanWarning::new(
-            Some(pid),
-            LockScanWarningKind::OpenProcess,
-            "failed to open process for handle duplication",
-        ));
+    let handle = match unsafe { OpenProcess(PROCESS_ACCESS_RIGHTS_DUP_HANDLE, false, pid) } {
+        Ok(handle) => handle,
+        Err(error) => {
+            let code = windows::Win32::Foundation::WIN32_ERROR(error.code().0 as u32);
+            return Err(LockScanWarning::new(
+                Some(pid),
+                LockScanWarningKind::OpenProcess,
+                format!(
+                    "failed to open process for handle duplication: Win32 error {}: {}",
+                    code.0,
+                    get_win32_error_message(&code)
+                ),
+            ));
+        }
     };
 
     let handle = HandleWrapper::new(handle);
@@ -453,6 +538,10 @@ fn get_process_owner_info(pid: u32) -> WholockResult<String> {
     }
 
     get_handle_owner_info(handle.get())
+}
+
+fn process_metadata_warning(pid: u32, message: impl Into<String>) -> LockScanWarning {
+    LockScanWarning::new(Some(pid), LockScanWarningKind::ProcessMetadata, message)
 }
 
 fn module_scan_warning(pid: u32, err: WholockError) -> LockScanWarning {
@@ -597,14 +686,38 @@ where
                 }
             };
 
+            let mut kernel_path_failures = Vec::new();
             for module_path in module_paths {
-                let kernel_path = kernel_path_for_path(&module_path).ok();
+                let kernel_path = match kernel_path_for_path(&module_path) {
+                    Ok(path) => Some(path),
+                    Err(err) => {
+                        kernel_path_failures.push(format!("{module_path}: {err}"));
+                        None
+                    }
+                };
                 if matchers.matches_resolved(&module_path, kernel_path.as_deref()) {
                     result
                         .entry(pid)
                         .or_insert_with(|| ProcessLockCollector::new(pid))
                         .insert_path(module_path);
                 }
+            }
+
+            if !kernel_path_failures.is_empty() {
+                let details = kernel_path_failures.iter().take(2).join("; ");
+                let suffix = if kernel_path_failures.len() > 2 {
+                    "; additional failures omitted"
+                } else {
+                    ""
+                };
+                warnings.push(LockScanWarning::new(
+                    Some(pid),
+                    LockScanWarningKind::ModuleEnumeration,
+                    format!(
+                        "failed to resolve NT paths for {} module(s); display-path matching continued: {details}{suffix}",
+                        kernel_path_failures.len()
+                    ),
+                ));
             }
         }
     }
@@ -733,7 +846,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             Ok(Some(ResolvedFilePath {
                 display_path: "C:\\slow.txt".to_string(),
-                kernel_path: "\\Device\\HarddiskVolume1\\slow.txt".to_string(),
+                kernel_path: Some("\\Device\\HarddiskVolume1\\slow.txt".to_string()),
+                kernel_path_error: None,
             }))
         });
         let result = worker.probe(std::process::id(), 1, Duration::from_millis(1));
@@ -752,11 +866,94 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_probe_error_preserves_diagnostic() {
+        let mut worker =
+            HandleProbeWorker::new(|_, _| Err(WholockError::handle("failed to resolve file path")));
+        let result = worker.probe(std::process::id(), 0x2a, Duration::from_secs(1));
+
+        assert!(matches!(
+            result,
+            HandleProbeOutcome::ProbeFailed(message)
+                if message.contains("failed to resolve file path")
+        ));
+    }
+
+    #[test]
+    fn test_handle_probe_failures_are_aggregated_per_process() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        File::create(&target).unwrap();
+        let matchers = LockedPathMatchers::new([target.to_str().unwrap()]).unwrap();
+        let mut worker =
+            HandleProbeWorker::new(|_, _| Err(WholockError::handle("failed to resolve file path")));
+
+        let result = scan_process_handles(
+            std::process::id(),
+            &[1, 2, 3, 4],
+            &matchers,
+            Duration::from_secs(1),
+            &mut worker,
+        );
+
+        assert!(result.process_info.is_none());
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!(
+            result.warnings[0].kind(),
+            LockScanWarningKind::HandleEnumeration
+        );
+        assert!(
+            result.warnings[0]
+                .message()
+                .contains("4 file handle path(s)")
+        );
+        assert!(
+            result.warnings[0]
+                .message()
+                .contains("additional failures omitted")
+        );
+    }
+
+    #[test]
+    fn test_kernel_path_fallback_is_reported() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        File::create(&target).unwrap();
+        let matchers = LockedPathMatchers::new([target.to_str().unwrap()]).unwrap();
+        let mut worker = HandleProbeWorker::new(|_, _| {
+            Ok(Some(ResolvedFilePath {
+                display_path: r"C:\different.txt".to_string(),
+                kernel_path: None,
+                kernel_path_error: Some("NT object name unavailable".to_string()),
+            }))
+        });
+
+        let result = scan_process_handles(
+            std::process::id(),
+            &[0x2a],
+            &matchers,
+            Duration::from_secs(1),
+            &mut worker,
+        );
+
+        assert!(result.process_info.is_none());
+        assert_eq!(result.warnings.len(), 1);
+        assert!(
+            result.warnings[0]
+                .message()
+                .contains("display-path matching continued")
+        );
+        assert!(result.warnings[0].message().contains("handle 0x2a"));
+    }
+
+    #[test]
     fn test_handle_probe_worker_reuses_thread_for_multiple_probes() {
         let mut worker = HandleProbeWorker::new(|_, source_handle| {
             Ok(Some(ResolvedFilePath {
                 display_path: format!("C:\\file-{source_handle}.txt"),
-                kernel_path: format!("\\Device\\HarddiskVolume1\\file-{source_handle}.txt"),
+                kernel_path: Some(format!(
+                    "\\Device\\HarddiskVolume1\\file-{source_handle}.txt"
+                )),
+                kernel_path_error: None,
             }))
         });
 
@@ -764,14 +961,16 @@ mod tests {
             worker.probe(std::process::id(), 1, Duration::from_secs(1)),
             HandleProbeOutcome::Path(ResolvedFilePath {
                 display_path: "C:\\file-1.txt".to_string(),
-                kernel_path: "\\Device\\HarddiskVolume1\\file-1.txt".to_string(),
+                kernel_path: Some("\\Device\\HarddiskVolume1\\file-1.txt".to_string()),
+                kernel_path_error: None,
             })
         );
         assert_eq!(
             worker.probe(std::process::id(), 2, Duration::from_secs(1)),
             HandleProbeOutcome::Path(ResolvedFilePath {
                 display_path: "C:\\file-2.txt".to_string(),
-                kernel_path: "\\Device\\HarddiskVolume1\\file-2.txt".to_string(),
+                kernel_path: Some("\\Device\\HarddiskVolume1\\file-2.txt".to_string()),
+                kernel_path_error: None,
             })
         );
         assert_eq!(worker.abandoned_workers, 0);
@@ -824,6 +1023,24 @@ mod tests {
         assert_eq!(warning.pid(), None);
         assert_eq!(warning.kind(), LockScanWarningKind::HandleEnumeration);
         assert!(warning.message().contains("buffer too small"));
+    }
+
+    #[test]
+    fn test_process_metadata_warning_preserves_pid_and_context() {
+        let warning = process_metadata_warning(42, "failed to query process owner");
+
+        assert_eq!(warning.pid(), Some(42));
+        assert_eq!(warning.kind(), LockScanWarningKind::ProcessMetadata);
+        assert!(warning.message().contains("process owner"));
+    }
+
+    #[test]
+    fn test_open_process_warning_includes_windows_error() {
+        let warning = verify_process_can_be_scanned(u32::MAX).unwrap_err();
+
+        assert_eq!(warning.pid(), Some(u32::MAX));
+        assert_eq!(warning.kind(), LockScanWarningKind::OpenProcess);
+        assert!(warning.message().contains("Win32 error"));
     }
 
     #[test]

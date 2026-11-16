@@ -396,5 +396,9 @@ mod tests {
         assert_eq!(warning.pid(), Some(42));
         assert_eq!(warning.kind(), LockScanWarningKind::ModuleEnumeration);
         assert_eq!(warning.message(), "access denied");
+        assert_eq!(
+            warning.to_string(),
+            "PID 42 module enumeration warning: access denied"
+        );
     }
 }

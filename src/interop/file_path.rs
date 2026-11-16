@@ -10,7 +10,8 @@ use super::object::get_object_name;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedFilePath {
     pub(crate) display_path: String,
-    pub(crate) kernel_path: String,
+    pub(crate) kernel_path: Option<String>,
+    pub(crate) kernel_path_error: Option<String>,
 }
 
 pub(crate) fn get_final_path_name_by_handle(h_file: &HANDLE) -> WholockResult<String> {
@@ -42,9 +43,15 @@ pub(crate) fn get_final_path_name_by_handle(h_file: &HANDLE) -> WholockResult<St
 }
 
 pub(crate) fn get_file_paths_by_handle(h_file: &HANDLE) -> WholockResult<ResolvedFilePath> {
+    let (kernel_path, kernel_path_error) = match get_object_name(*h_file) {
+        Ok(path) => (Some(path), None),
+        Err(err) => (None, Some(err.to_string())),
+    };
+
     Ok(ResolvedFilePath {
         display_path: get_final_path_name_by_handle(h_file)?,
-        kernel_path: get_object_name(*h_file).unwrap_or_default(),
+        kernel_path,
+        kernel_path_error,
     })
 }
 
@@ -96,6 +103,12 @@ mod tests {
         let paths = get_file_paths_by_handle(&handle).unwrap();
 
         assert!(paths.display_path.ends_with("resolved.txt"));
-        assert!(paths.kernel_path.ends_with("resolved.txt"));
+        assert!(
+            paths
+                .kernel_path
+                .as_deref()
+                .is_some_and(|path| path.ends_with("resolved.txt"))
+        );
+        assert!(paths.kernel_path_error.is_none());
     }
 }

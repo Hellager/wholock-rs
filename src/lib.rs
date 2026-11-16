@@ -69,7 +69,7 @@
 //!     let scan = scan_locks(["C:\\work", "C:\\data\\database.lock"], options)?;
 //!
 //!     for warning in scan.warnings() {
-//!         eprintln!("{} warning: {}", warning.kind(), warning.message());
+//!         eprintln!("{warning}");
 //!     }
 //!
 //!     for result in unlock_processes(scan.processes()) {

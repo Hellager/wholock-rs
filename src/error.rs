@@ -8,6 +8,7 @@ use windows::core::Error as WindowsError;
 pub enum LockScanWarningKind {
     DebugPrivilege,
     OpenProcess,
+    ProcessMetadata,
     HandleEnumeration,
     ModuleEnumeration,
 }
@@ -17,6 +18,7 @@ impl fmt::Display for LockScanWarningKind {
         match self {
             LockScanWarningKind::DebugPrivilege => f.write_str("debug privilege"),
             LockScanWarningKind::OpenProcess => f.write_str("open process"),
+            LockScanWarningKind::ProcessMetadata => f.write_str("process metadata"),
             LockScanWarningKind::HandleEnumeration => f.write_str("handle enumeration"),
             LockScanWarningKind::ModuleEnumeration => f.write_str("module enumeration"),
         }
@@ -60,6 +62,16 @@ impl LockScanWarning {
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
+    }
+}
+
+impl fmt::Display for LockScanWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(pid) = self.pid {
+            write!(f, "PID {pid} {} warning: {}", self.kind, self.message)
+        } else {
+            write!(f, "{} warning: {}", self.kind, self.message)
+        }
     }
 }
 
