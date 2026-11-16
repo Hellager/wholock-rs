@@ -63,11 +63,18 @@ fn main() {
                 println!("Files unlocked after {:.2}s", result.elapsed.as_secs_f64());
             }
             Ok(result) => {
-                eprintln!(
-                    "Timed out after {:.2}s; {} process(es) still locking the file",
-                    result.elapsed.as_secs_f64(),
-                    result.remaining_locks.len()
-                );
+                if result.is_inconclusive() {
+                    eprintln!(
+                        "Timed out after {:.2}s; scan warnings prevented unlock confirmation",
+                        result.elapsed.as_secs_f64()
+                    );
+                } else {
+                    eprintln!(
+                        "Timed out after {:.2}s; {} process(es) still locking the file",
+                        result.elapsed.as_secs_f64(),
+                        result.remaining_locks.len()
+                    );
+                }
                 std::process::exit(1);
             }
             Err(e) => {

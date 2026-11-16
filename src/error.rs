@@ -63,6 +63,12 @@ impl LockScanWarning {
     pub fn message(&self) -> &str {
         &self.message
     }
+
+    /// Whether this warning may mean that one or more lock holders were missed.
+    #[must_use]
+    pub fn affects_completeness(&self) -> bool {
+        self.kind != LockScanWarningKind::ProcessMetadata
+    }
 }
 
 impl fmt::Display for LockScanWarning {
@@ -263,5 +269,32 @@ impl From<WIN32_ERROR> for WholockError {
 impl From<String> for WholockError {
     fn from(error: String) -> Self {
         WholockError::other(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_metadata_warning_does_not_affect_scan_completeness() {
+        let warning = LockScanWarning::new(
+            Some(42),
+            LockScanWarningKind::ProcessMetadata,
+            "process owner unavailable",
+        );
+
+        assert!(!warning.affects_completeness());
+    }
+
+    #[test]
+    fn scan_coverage_warning_affects_scan_completeness() {
+        let warning = LockScanWarning::new(
+            Some(42),
+            LockScanWarningKind::HandleEnumeration,
+            "handle probe timed out",
+        );
+
+        assert!(warning.affects_completeness());
     }
 }

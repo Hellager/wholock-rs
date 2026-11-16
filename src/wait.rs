@@ -1,5 +1,9 @@
 use crate::scan::scan_locks;
-use crate::{WholockResult, types::LockScanOptions, types::WaitForUnlockResult};
+use crate::{
+    ProcessInfo, WholockResult,
+    error::LockScanWarning,
+    types::{LockScanOptions, WaitForUnlockResult},
+};
 use std::time::{Duration, Instant};
 
 const WAIT_FOR_UNLOCK_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -31,7 +35,11 @@ const WAIT_FOR_UNLOCK_POLL_INTERVAL: Duration = Duration::from_millis(200);
 ///
 /// let result = wait_for_unlock("C:\\path\\to\\file.txt", Some(Duration::from_secs(5)))?;
 /// if result.timed_out() {
-///     println!("still locked by {} process(es)", result.remaining_locks.len());
+///     if result.is_inconclusive() {
+///         println!("unlock status could not be confirmed");
+///     } else {
+///         println!("still locked by {} process(es)", result.remaining_locks.len());
+///     }
 /// }
 /// # Ok::<(), wholock::error::WholockError>(())
 /// ```
@@ -54,8 +62,8 @@ pub fn wait_for_unlock(
 ///
 /// # Returns
 ///
-/// Returns `WholockResult<WaitForUnlockResult>` with `unlocked` set to `true` when no
-/// matching locks remain.
+/// Returns `WholockResult<WaitForUnlockResult>` with `unlocked` set to `true` when a
+/// complete scan confirms that no matching locks remain.
 ///
 /// # Errors
 ///
@@ -94,10 +102,11 @@ where
     loop {
         let scan = scan_locks(paths.iter().map(String::as_str), LockScanOptions::new())?;
         let (remaining_locks, scan_warnings) = scan.into_parts();
-        warnings.extend(scan_warnings);
+        let confirmed_unlocked = scan_confirms_unlock(&remaining_locks, &scan_warnings);
+        extend_unique_warnings(&mut warnings, scan_warnings);
         let elapsed = start.elapsed();
 
-        if remaining_locks.is_empty() {
+        if confirmed_unlocked {
             return Ok(WaitForUnlockResult {
                 unlocked: true,
                 elapsed,
@@ -106,7 +115,7 @@ where
             });
         }
 
-        if timeout.is_some_and(|timeout| elapsed > timeout) {
+        if timeout.is_some_and(|timeout| elapsed >= timeout) {
             return Ok(WaitForUnlockResult {
                 unlocked: false,
                 elapsed,
@@ -126,11 +135,88 @@ where
     }
 }
 
+fn scan_confirms_unlock(remaining_locks: &[ProcessInfo], warnings: &[LockScanWarning]) -> bool {
+    remaining_locks.is_empty() && !warnings.iter().any(LockScanWarning::affects_completeness)
+}
+
+fn extend_unique_warnings(accumulated: &mut Vec<LockScanWarning>, incoming: Vec<LockScanWarning>) {
+    for warning in incoming {
+        if !accumulated.contains(&warning) {
+            accumulated.push(warning);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::WholockError;
+    use crate::error::{LockScanWarningKind, WholockError};
     use tempfile::tempdir;
+
+    fn process(pid: u32) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            process_name: format!("process-{pid}.exe"),
+            process_exe_path: String::new(),
+            domain_username: String::new(),
+            locked_file: Vec::new(),
+        }
+    }
+
+    fn warning(kind: LockScanWarningKind) -> LockScanWarning {
+        LockScanWarning::new(Some(42), kind, "scan warning")
+    }
+
+    #[test]
+    fn empty_complete_scan_confirms_unlock() {
+        assert!(scan_confirms_unlock(&[], &[]));
+    }
+
+    #[test]
+    fn metadata_warning_does_not_prevent_unlock_confirmation() {
+        let warnings = [warning(LockScanWarningKind::ProcessMetadata)];
+
+        assert!(scan_confirms_unlock(&[], &warnings));
+    }
+
+    #[test]
+    fn coverage_warning_prevents_unlock_confirmation() {
+        for kind in [
+            LockScanWarningKind::DebugPrivilege,
+            LockScanWarningKind::OpenProcess,
+            LockScanWarningKind::HandleEnumeration,
+            LockScanWarningKind::ModuleEnumeration,
+        ] {
+            assert!(!scan_confirms_unlock(&[], &[warning(kind)]));
+        }
+    }
+
+    #[test]
+    fn remaining_lock_prevents_unlock_confirmation() {
+        assert!(!scan_confirms_unlock(&[process(42)], &[]));
+    }
+
+    #[test]
+    fn warning_accumulation_deduplicates_identical_warnings() {
+        let duplicate = warning(LockScanWarningKind::HandleEnumeration);
+        let mut warnings = vec![duplicate.clone()];
+
+        extend_unique_warnings(&mut warnings, vec![duplicate]);
+
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn warning_accumulation_preserves_distinct_warnings() {
+        let mut warnings = vec![warning(LockScanWarningKind::DebugPrivilege)];
+
+        extend_unique_warnings(
+            &mut warnings,
+            vec![warning(LockScanWarningKind::HandleEnumeration)],
+        );
+
+        assert_eq!(warnings.len(), 2);
+    }
 
     #[test]
     fn test_wait_for_unlock_missing_path_returns_error() {

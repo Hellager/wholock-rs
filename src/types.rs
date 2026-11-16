@@ -284,13 +284,15 @@ impl ProcessTerminationFailure {
 /// [`wait_for_unlock_files`](crate::wait_for_unlock_files).
 #[derive(Debug, Clone)]
 pub struct WaitForUnlockResult {
-    /// Whether all matching locks disappeared before the timeout elapsed.
+    /// Whether a complete scan confirmed that all matching locks disappeared.
     pub unlocked: bool,
     /// Time spent polling for locks.
     pub elapsed: Duration,
-    /// Lock holders still present when the wait timed out.
+    /// Lock holders found by the final scan when the wait timed out.
+    ///
+    /// This can be empty when scan warnings prevented unlock confirmation.
     pub remaining_locks: Vec<ProcessInfo>,
-    /// Recoverable scan failures observed while polling.
+    /// Unique recoverable scan failures observed while polling.
     pub warnings: Vec<LockScanWarning>,
 }
 
@@ -302,6 +304,20 @@ impl WaitForUnlockResult {
     /// Returns `true` when [`WaitForUnlockResult::unlocked`] is `false`.
     pub fn timed_out(&self) -> bool {
         !self.unlocked
+    }
+
+    /// Returns whether the wait timed out without confirming either locks or unlock.
+    ///
+    /// This occurs when the final scan found no locks but warnings indicate that lock
+    /// holders may have been missed.
+    #[must_use]
+    pub fn is_inconclusive(&self) -> bool {
+        !self.unlocked
+            && self.remaining_locks.is_empty()
+            && self
+                .warnings
+                .iter()
+                .any(LockScanWarning::affects_completeness)
     }
 }
 
@@ -400,5 +416,54 @@ mod tests {
             warning.to_string(),
             "PID 42 module enumeration warning: access denied"
         );
+    }
+
+    #[test]
+    fn test_wait_result_reports_inconclusive_scan() {
+        let result = WaitForUnlockResult {
+            unlocked: false,
+            elapsed: Duration::from_secs(1),
+            remaining_locks: Vec::new(),
+            warnings: vec![LockScanWarning::new(
+                None,
+                LockScanWarningKind::DebugPrivilege,
+                "debug privilege unavailable",
+            )],
+        };
+
+        assert!(result.timed_out());
+        assert!(result.is_inconclusive());
+    }
+
+    #[test]
+    fn test_wait_result_with_known_locks_is_not_inconclusive() {
+        let result = WaitForUnlockResult {
+            unlocked: false,
+            elapsed: Duration::from_secs(1),
+            remaining_locks: vec![process(42)],
+            warnings: vec![LockScanWarning::new(
+                None,
+                LockScanWarningKind::DebugPrivilege,
+                "debug privilege unavailable",
+            )],
+        };
+
+        assert!(!result.is_inconclusive());
+    }
+
+    #[test]
+    fn test_unlocked_wait_result_is_not_inconclusive() {
+        let result = WaitForUnlockResult {
+            unlocked: true,
+            elapsed: Duration::from_secs(1),
+            remaining_locks: Vec::new(),
+            warnings: vec![LockScanWarning::new(
+                None,
+                LockScanWarningKind::DebugPrivilege,
+                "earlier scan was incomplete",
+            )],
+        };
+
+        assert!(!result.is_inconclusive());
     }
 }
