@@ -1,6 +1,6 @@
 use crate::{WholockResult, error::WholockError};
 use std::{ffi::c_void, ptr};
-use windows::Win32::Foundation::{CloseHandle, DUPLICATE_HANDLE_OPTIONS, DuplicateHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
 
 #[cfg(test)]
 use super::nt_handles::HandleEntry;
@@ -46,7 +46,7 @@ fn duplicate_handle_blocking(
             &mut target_handle,
             0,
             false,
-            DUPLICATE_HANDLE_OPTIONS(0),
+            DUPLICATE_SAME_ACCESS,
         )
     };
 

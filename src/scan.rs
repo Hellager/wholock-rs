@@ -3,9 +3,10 @@ use crate::error::{LockScanWarning, LockScanWarningKind, WholockError, get_win32
 use crate::interop::{
     LockedPathMatchers, PROCESS_ACCESS_RIGHTS_DUP_HANDLE, PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
     ResolvedFilePath, SYSTEM_EXTENDED_HANDLE_INFORMATION, duplicate_handle_value,
-    get_final_path_name_by_handle, get_handle_owner_info, get_handle_table, get_object_name,
-    get_process_identity, get_process_ids, get_process_module_paths, is_disk_file_handle,
-    kernel_path_for_path, query_system_information_buffer,
+    get_file_identity_by_handle, get_final_path_name_by_handle, get_handle_owner_info,
+    get_handle_table, get_object_name, get_process_identity, get_process_ids,
+    get_process_module_paths, is_disk_file_handle, kernel_path_for_path,
+    query_system_information_buffer,
 };
 use crate::{
     WholockResult,
@@ -353,12 +354,37 @@ fn probe_handle_path_blocking(
 
     let (kernel_path, kernel_path_error) = match get_object_name(dup_handle.get()) {
         Ok(kernel_path) => {
+            if let Some(display_path) = matchers.matching_display_path(Some(&kernel_path), None) {
+                return Ok(Some(ResolvedFilePath {
+                    display_path,
+                    kernel_path: Some(kernel_path),
+                    kernel_path_error: None,
+                }));
+            }
+            let file_identity = get_file_identity_by_handle(dup_handle.get()).ok();
+            if let Some(display_path) = matchers.matching_display_path(None, file_identity) {
+                return Ok(Some(ResolvedFilePath {
+                    display_path,
+                    kernel_path: Some(kernel_path),
+                    kernel_path_error: None,
+                }));
+            }
             if matchers.kernel_paths_complete() && !matchers.matches_kernel(&kernel_path) {
                 return Ok(None);
             }
             (Some(kernel_path), None)
         }
-        Err(err) => (None, Some(err.to_string())),
+        Err(err) => {
+            let file_identity = get_file_identity_by_handle(dup_handle.get()).ok();
+            if let Some(display_path) = matchers.matching_display_path(None, file_identity) {
+                return Ok(Some(ResolvedFilePath {
+                    display_path,
+                    kernel_path: None,
+                    kernel_path_error: Some(err.to_string()),
+                }));
+            }
+            (None, Some(err.to_string()))
+        }
     };
     let paths = ResolvedFilePath {
         display_path: get_final_path_name_by_handle(&dup_handle.get())?,
@@ -945,6 +971,105 @@ mod tests {
     use std::os::windows::io::AsRawHandle;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows::Win32::System::Threading::GetProcessHandleCount;
+
+    fn current_process_handle_count() -> u32 {
+        let mut count = 0;
+        // SAFETY: GetCurrentProcess returns a documented pseudo-handle, and
+        // `count` is a valid writable output pointer for the duration of the call.
+        unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) }
+            .expect("failed to count current process handles");
+        count
+    }
+
+    fn current_process_thread_count() -> usize {
+        // SAFETY: The snapshot call has no pointer arguments. Its owned result is
+        // immediately wrapped so it is closed exactly once after enumeration.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
+            .expect("failed to create thread snapshot");
+        let snapshot = HandleWrapper::new(snapshot);
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            ..THREADENTRY32::default()
+        };
+        let mut count = 0;
+
+        // SAFETY: `entry` has the required size and remains writable throughout
+        // the snapshot enumeration. `snapshot` is live until this function exits.
+        if unsafe { Thread32First(snapshot.get(), &mut entry) }.is_ok() {
+            loop {
+                if entry.th32OwnerProcessID == std::process::id() {
+                    count += 1;
+                }
+                // SAFETY: The same live snapshot and initialized writable entry
+                // are reused for each subsequent enumeration call.
+                if unsafe { Thread32Next(snapshot.get(), &mut entry) }.is_err() {
+                    break;
+                }
+            }
+        }
+
+        count
+    }
+
+    fn wait_for_resource_cleanup(max_threads: usize, max_handles: u32) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            if current_process_thread_count() <= max_threads
+                && current_process_handle_count() <= max_handles
+            {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        current_process_thread_count() <= max_threads
+            && current_process_handle_count() <= max_handles
+    }
+
+    fn run_abandoned_probe_round() {
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_release = Arc::clone(&release);
+        let budget = Arc::new(HandleProbeTimeoutBudget::new(
+            MAX_ABANDONED_HANDLE_PROBE_WORKERS,
+        ));
+        let mut worker = HandleProbeWorker::with_timeout_budget(
+            move |_, _| {
+                let (released, signal) = &*worker_release;
+                let mut released = released
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                while !*released {
+                    released = signal
+                        .wait(released)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                Ok(None)
+            },
+            budget,
+        );
+
+        for handle in 0..MAX_ABANDONED_HANDLE_PROBE_WORKERS {
+            assert_eq!(
+                worker.probe(std::process::id(), handle, Duration::from_millis(2)),
+                HandleProbeOutcome::TimedOut
+            );
+        }
+        assert_eq!(
+            worker.probe(std::process::id(), usize::MAX, Duration::from_millis(2)),
+            HandleProbeOutcome::WorkerLimitReached
+        );
+
+        let (released, signal) = &*release;
+        *released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        signal.notify_all();
+        drop(worker);
+    }
 
     fn scan_processes(path: &str) -> Vec<ProcessInfo> {
         who_locks_file(path)
@@ -1088,6 +1213,27 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_probe_matches_hard_link_by_file_identity() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        let hard_link = dir.path().join("hard-link.txt");
+        File::create(&target).unwrap();
+        std::fs::hard_link(&target, &hard_link).unwrap();
+        let matchers = LockedPathMatchers::new([hard_link.to_str().unwrap()]).unwrap();
+        let target = File::open(target).unwrap();
+        // SAFETY: GetCurrentProcess returns the documented pseudo-handle for
+        // the current process and is only used as a DuplicateHandle source.
+        let current_process = unsafe { GetCurrentProcess() };
+
+        let result =
+            probe_handle_path_blocking(current_process, target.as_raw_handle() as usize, &matchers)
+                .unwrap()
+                .expect("hard-link identity should match the open file handle");
+
+        assert_eq!(result.display_path, hard_link.to_string_lossy());
+    }
+
+    #[test]
     fn test_partial_lock_scan_display_mentions_warning() {
         let error = WholockError::PartialLockScan {
             processes: Vec::new(),
@@ -1140,6 +1286,24 @@ mod tests {
             limited_worker.probe(std::process::id(), 2, Duration::from_secs(1)),
             HandleProbeOutcome::WorkerLimitReached
         );
+    }
+
+    #[test]
+    fn test_repeated_timeout_scans_release_threads_and_handles() {
+        let baseline_threads = current_process_thread_count();
+        let baseline_handles = current_process_handle_count();
+
+        for _ in 0..2 {
+            run_abandoned_probe_round();
+            assert!(
+                wait_for_resource_cleanup(baseline_threads + 2, baseline_handles + 8),
+                "timed-out probes leaked resources: threads {} -> {}, handles {} -> {}",
+                baseline_threads,
+                current_process_thread_count(),
+                baseline_handles,
+                current_process_handle_count()
+            );
+        }
     }
 
     #[test]

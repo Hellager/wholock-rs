@@ -1,5 +1,5 @@
 use crate::{WholockResult, error::WholockError};
-use std::path::Path;
+use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::Path};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
 use windows::Win32::Storage::FileSystem::{
@@ -8,7 +8,10 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::core::PCWSTR;
 
-use super::file_path::{get_final_path_name_by_handle, strip_extended_path_prefix};
+use super::file_path::{
+    FileIdentity, get_file_identity_by_handle, get_final_path_name_by_handle,
+    strip_extended_path_prefix,
+};
 use super::handle::SafeHandle;
 use super::object::get_object_name;
 
@@ -111,6 +114,7 @@ fn directory_match_prefix(path: &str) -> String {
 }
 
 struct PathIdentity {
+    display_path: String,
     path: Vec<u16>,
     directory_prefix: Option<Vec<u16>>,
 }
@@ -125,6 +129,7 @@ impl PathIdentity {
         });
         Self {
             path: path.encode_utf16().collect(),
+            display_path: path,
             directory_prefix,
         }
     }
@@ -142,11 +147,36 @@ impl PathIdentity {
                     && windows_ignore_case_eq_wide(&path[..prefix.len()], prefix)
             })
     }
+
+    fn matched_suffix<'a>(&self, path: &'a [u16]) -> Option<&'a [u16]> {
+        if windows_ignore_case_eq_wide(path, &self.path) {
+            return Some(&path[path.len()..]);
+        }
+
+        self.directory_prefix.as_ref().and_then(|prefix| {
+            (path.len() >= prefix.len()
+                && windows_ignore_case_eq_wide(&path[..prefix.len()], prefix))
+            .then(|| &path[prefix.len()..])
+        })
+    }
+
+    fn display_path_with_suffix(&self, suffix: &[u16]) -> String {
+        if suffix.is_empty() {
+            return self.display_path.clone();
+        }
+
+        format!(
+            "{}\\{}",
+            self.display_path,
+            OsString::from_wide(suffix).to_string_lossy()
+        )
+    }
 }
 
 pub(crate) struct LockedPathMatcher {
     display: PathIdentity,
     kernel: Option<PathIdentity>,
+    file_identity: Option<FileIdentity>,
 }
 
 impl LockedPathMatcher {
@@ -163,8 +193,15 @@ impl LockedPathMatcher {
             .ok()
             .filter(|path| !path.is_empty())
             .map(|path| PathIdentity::new(&path, is_directory));
+        let file_identity = file_identity_for_path(target_path)
+            .or_else(|_| file_identity_for_path(&resolved_path))
+            .ok();
 
-        Self { display, kernel }
+        Self {
+            display,
+            kernel,
+            file_identity,
+        }
     }
 
     #[cfg(test)]
@@ -176,6 +213,25 @@ impl LockedPathMatcher {
     pub(crate) fn matches(&self, path: &str) -> bool {
         self.matches_display(path)
     }
+}
+
+fn file_identity_for_path(path: &str) -> WholockResult<FileIdentity> {
+    let path_wide = wide_null(path);
+    // SAFETY: `path_wide` is a null-terminated UTF-16 path buffer that lives
+    // until CreateFileW returns. The returned handle is wrapped in SafeHandle.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path_wide.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            Some(HANDLE::default()),
+        )
+    }?;
+    let handle = SafeHandle::new(handle)?;
+    get_file_identity_by_handle(handle.as_raw())
 }
 
 pub(crate) struct LockedPathMatchers {
@@ -216,6 +272,30 @@ impl LockedPathMatchers {
                 .as_ref()
                 .is_some_and(|identity| identity.matches_normalized(&kernel_path))
         })
+    }
+
+    pub(crate) fn matching_display_path(
+        &self,
+        kernel_path: Option<&str>,
+        file_identity: Option<FileIdentity>,
+    ) -> Option<String> {
+        if let Some(kernel_path) = kernel_path {
+            let kernel_path = normalize_path(kernel_path)
+                .encode_utf16()
+                .collect::<Vec<_>>();
+            if let Some(display_path) = self.matchers.iter().find_map(|matcher| {
+                let suffix = matcher.kernel.as_ref()?.matched_suffix(&kernel_path)?;
+                Some(matcher.display.display_path_with_suffix(suffix))
+            }) {
+                return Some(display_path);
+            }
+        }
+
+        let file_identity = file_identity?;
+        self.matchers
+            .iter()
+            .find(|matcher| matcher.file_identity == Some(file_identity))
+            .map(|matcher| matcher.display.display_path.clone())
     }
 
     #[cfg(test)]
@@ -348,6 +428,20 @@ mod tests {
         assert!(matchers.kernel_paths_complete());
         assert!(matchers.matches_kernel(&kernel_path));
         assert!(matchers.matches_resolved(r"Z:\alias\kernel-match.txt", Some(&kernel_path)));
+    }
+
+    #[test]
+    fn test_hard_links_share_file_identity() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        let hard_link = dir.path().join("hard-link.txt");
+        File::create(&target).unwrap();
+        std::fs::hard_link(&target, &hard_link).unwrap();
+
+        let target_identity = file_identity_for_path(target.to_str().unwrap()).unwrap();
+        let link_identity = file_identity_for_path(hard_link.to_str().unwrap()).unwrap();
+
+        assert_eq!(target_identity, link_identity);
     }
 
     #[test]

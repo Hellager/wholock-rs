@@ -6,7 +6,9 @@ mod path_matcher;
 mod process;
 mod token;
 
-pub(crate) use file_path::{ResolvedFilePath, get_final_path_name_by_handle};
+pub(crate) use file_path::{
+    ResolvedFilePath, get_file_identity_by_handle, get_final_path_name_by_handle,
+};
 pub(crate) use handle::{SafeHandle, duplicate_handle_value};
 #[allow(unused_imports)]
 pub(crate) use nt_handles::{

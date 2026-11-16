@@ -276,10 +276,29 @@ fn terminate_process_by_pid_detailed(pid: u32) -> Result<(), ProcessTerminationF
 }
 
 fn terminate_process_from_snapshot(process: &ProcessInfo) -> Result<(), ProcessTerminationFailure> {
-    let (process_handle, current_identity) = open_checked_process(process.pid)?;
+    terminate_process_from_snapshot_with(
+        process,
+        open_checked_process,
+        process_still_holds_snapshot_locks,
+        terminate_checked_process,
+    )
+}
+
+fn terminate_process_from_snapshot_with<H, O, V, T>(
+    process: &ProcessInfo,
+    open_process: O,
+    verify_locks: V,
+    terminate_process: T,
+) -> Result<(), ProcessTerminationFailure>
+where
+    O: FnOnce(u32) -> Result<(H, ProcessIdentity), ProcessTerminationFailure>,
+    V: FnOnce(&ProcessInfo) -> Result<(), ProcessTerminationFailure>,
+    T: FnOnce(u32, &H) -> Result<(), ProcessTerminationFailure>,
+{
+    let (process_handle, current_identity) = open_process(process.pid)?;
     process_identity_matches_snapshot(process, &current_identity)?;
-    process_still_holds_snapshot_locks(process)?;
-    terminate_checked_process(process.pid, &process_handle)
+    verify_locks(process)?;
+    terminate_process(process.pid, &process_handle)
 }
 
 fn terminate_process_by_pid(pid: u32) -> WholockResult<()> {
@@ -393,6 +412,7 @@ pub fn unlock_processes(processes: &[ProcessInfo]) -> Vec<UnlockProcessResult> {
 mod tests {
     use super::*;
     use crate::types::{LockMatch, LockMatchSource};
+    use std::cell::{Cell, RefCell};
 
     fn process_snapshot(
         pid: u32,
@@ -558,6 +578,117 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn test_snapshot_termination_stops_before_revalidation_on_pid_reuse() {
+        let process = process_snapshot(42, "worker.exe", r"C:\apps\worker.exe", Some(100));
+        let verified = Cell::new(false);
+        let terminated = Cell::new(false);
+
+        let result = terminate_process_from_snapshot_with(
+            &process,
+            |_| {
+                Ok((
+                    7_u32,
+                    process_identity("worker.exe", r"C:\apps\worker.exe", 200),
+                ))
+            },
+            |_| {
+                verified.set(true);
+                Ok(())
+            },
+            |_, _| {
+                terminated.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(ProcessTerminationFailure {
+                kind: ProcessTerminationFailureKind::StaleProcessIdentity,
+                ..
+            })
+        ));
+        assert!(!verified.get());
+        assert!(!terminated.get());
+    }
+
+    #[test]
+    fn test_snapshot_termination_stops_when_lock_revalidation_loses_race() {
+        let process = process_snapshot(42, "worker.exe", r"C:\apps\worker.exe", Some(100));
+        let terminated = Cell::new(false);
+
+        let result = terminate_process_from_snapshot_with(
+            &process,
+            |_| {
+                Ok((
+                    7_u32,
+                    process_identity("worker.exe", r"C:\apps\worker.exe", 100),
+                ))
+            },
+            |_| {
+                Err(ProcessTerminationFailure {
+                    pid: 42,
+                    kind: ProcessTerminationFailureKind::LockNoLongerHeld,
+                    reason: "process released the lock during revalidation".to_string(),
+                })
+            },
+            |_, _| {
+                terminated.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(ProcessTerminationFailure {
+                kind: ProcessTerminationFailureKind::LockNoLongerHeld,
+                ..
+            })
+        ));
+        assert!(!terminated.get());
+    }
+
+    #[test]
+    fn test_snapshot_termination_uses_validated_handle_through_final_stage() {
+        let process = process_snapshot(42, "worker.exe", r"C:\apps\worker.exe", Some(100));
+        let stages = RefCell::new(Vec::new());
+
+        let result = terminate_process_from_snapshot_with(
+            &process,
+            |_| {
+                stages.borrow_mut().push("open");
+                Ok((
+                    77_u32,
+                    process_identity("worker.exe", r"C:\apps\worker.exe", 100),
+                ))
+            },
+            |_| {
+                stages.borrow_mut().push("verify");
+                Ok(())
+            },
+            |pid, handle| {
+                stages.borrow_mut().push("terminate");
+                assert_eq!(pid, 42);
+                assert_eq!(*handle, 77);
+                Err(ProcessTerminationFailure {
+                    pid,
+                    kind: ProcessTerminationFailureKind::TerminateProcess,
+                    reason: "process exited immediately before termination".to_string(),
+                })
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(ProcessTerminationFailure {
+                kind: ProcessTerminationFailureKind::TerminateProcess,
+                ..
+            })
+        ));
+        assert_eq!(*stages.borrow(), ["open", "verify", "terminate"]);
     }
 
     #[test]

@@ -2,7 +2,7 @@ use crate::scan::scan_locks;
 use crate::{
     ProcessInfo, WholockResult,
     error::LockScanWarning,
-    types::{LockScanOptions, WaitForUnlockResult},
+    types::{LockScanOptions, LockScanResult, WaitForUnlockResult},
 };
 use std::time::{Duration, Instant};
 
@@ -96,11 +96,25 @@ where
         .into_iter()
         .map(|path| path.as_ref().to_string())
         .collect::<Vec<_>>();
+    wait_for_unlock_files_with(&paths, timeout, WAIT_FOR_UNLOCK_POLL_INTERVAL, |paths| {
+        scan_locks(paths.iter().map(String::as_str), LockScanOptions::new())
+    })
+}
+
+fn wait_for_unlock_files_with<F>(
+    paths: &[String],
+    timeout: Option<Duration>,
+    poll_interval: Duration,
+    mut scan_paths: F,
+) -> WholockResult<WaitForUnlockResult>
+where
+    F: FnMut(&[String]) -> WholockResult<LockScanResult>,
+{
     let start = Instant::now();
     let mut warnings = Vec::new();
 
     loop {
-        let scan = scan_locks(paths.iter().map(String::as_str), LockScanOptions::new())?;
+        let scan = scan_paths(paths)?;
         let (remaining_locks, scan_warnings) = scan.into_parts();
         let confirmed_unlocked = scan_confirms_unlock(&remaining_locks, &scan_warnings);
         extend_unique_warnings(&mut warnings, scan_warnings);
@@ -125,12 +139,8 @@ where
         }
 
         let sleep_for = timeout
-            .map(|timeout| {
-                timeout
-                    .saturating_sub(elapsed)
-                    .min(WAIT_FOR_UNLOCK_POLL_INTERVAL)
-            })
-            .unwrap_or(WAIT_FOR_UNLOCK_POLL_INTERVAL);
+            .map(|timeout| timeout.saturating_sub(elapsed).min(poll_interval))
+            .unwrap_or(poll_interval);
         std::thread::sleep(sleep_for);
     }
 }
@@ -218,6 +228,56 @@ mod tests {
         );
 
         assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn repeated_incomplete_scans_time_out_inconclusively() {
+        let paths = vec![r"C:\data\locked.txt".to_string()];
+        let mut scan_count = 0;
+        let result = wait_for_unlock_files_with(
+            &paths,
+            Some(Duration::from_millis(10)),
+            Duration::from_millis(1),
+            |_| {
+                scan_count += 1;
+                Ok(LockScanResult::new(
+                    Vec::new(),
+                    vec![warning(LockScanWarningKind::HandleEnumeration)],
+                ))
+            },
+        )
+        .expect("injected scans should not fail");
+
+        assert!(scan_count >= 2);
+        assert!(result.timed_out());
+        assert!(result.is_inconclusive());
+        assert!(result.remaining_locks.is_empty());
+        assert_eq!(result.warnings.len(), 1);
+    }
+
+    #[test]
+    fn later_complete_scan_can_confirm_unlock() {
+        let paths = vec![r"C:\data\locked.txt".to_string()];
+        let mut scan_count = 0;
+        let result = wait_for_unlock_files_with(
+            &paths,
+            Some(Duration::from_secs(1)),
+            Duration::ZERO,
+            |_| {
+                scan_count += 1;
+                let warnings = if scan_count == 1 {
+                    vec![warning(LockScanWarningKind::HandleEnumeration)]
+                } else {
+                    Vec::new()
+                };
+                Ok(LockScanResult::new(Vec::new(), warnings))
+            },
+        )
+        .expect("injected scans should not fail");
+
+        assert_eq!(scan_count, 2);
+        assert!(result.unlocked);
+        assert_eq!(result.warnings.len(), 1);
     }
 
     #[test]

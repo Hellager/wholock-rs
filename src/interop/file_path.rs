@@ -2,7 +2,8 @@ use crate::WholockResult;
 use std::{ffi::OsString, os::windows::ffi::OsStringExt};
 use windows::Win32::Foundation::{GetLastError, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    GETFINALPATHNAMEBYHANDLE_FLAGS, GetFinalPathNameByHandleW,
+    BY_HANDLE_FILE_INFORMATION, GETFINALPATHNAMEBYHANDLE_FLAGS, GetFileInformationByHandle,
+    GetFinalPathNameByHandleW,
 };
 
 #[cfg(test)]
@@ -13,6 +14,25 @@ pub(crate) struct ResolvedFilePath {
     pub(crate) display_path: String,
     pub(crate) kernel_path: Option<String>,
     pub(crate) kernel_path_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileIdentity {
+    volume_serial_number: u32,
+    file_index: u64,
+}
+
+pub(crate) fn get_file_identity_by_handle(h_file: HANDLE) -> WholockResult<FileIdentity> {
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `h_file` is expected to be a live file handle, and `information`
+    // is a valid writable output buffer for the duration of the call.
+    unsafe { GetFileInformationByHandle(h_file, &mut information) }?;
+
+    Ok(FileIdentity {
+        volume_serial_number: information.dwVolumeSerialNumber,
+        file_index: u64::from(information.nFileIndexHigh) << 32
+            | u64::from(information.nFileIndexLow),
+    })
 }
 
 pub(crate) fn get_final_path_name_by_handle(h_file: &HANDLE) -> WholockResult<String> {
