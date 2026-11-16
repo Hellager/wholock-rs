@@ -1,14 +1,15 @@
 use crate::WholockResult;
 use crate::error::WholockError;
-use crate::interop::get_process_info;
-use crate::scan::HandleWrapper;
+use crate::interop::{ProcessIdentity, SafeHandle, get_process_identity_by_handle};
 use crate::scan::scan_locks;
 use crate::types::{
     LockScanOptions, ProcessInfo, ProcessTerminationFailure, ProcessTerminationFailureKind,
     UnlockProcessResult,
 };
 use std::collections::BTreeSet;
-use windows::Win32::System::Threading::{OpenProcess, TerminateProcess};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+};
 
 fn sanitize_pid(pid: u32) -> WholockResult<()> {
     let system = sysinfo::System::new_all();
@@ -57,7 +58,7 @@ fn protected_process_name_reason(process_name: &str) -> Option<&'static str> {
         .find(|protected_name| process_name.eq_ignore_ascii_case(protected_name))
 }
 
-fn check_pid_can_be_terminated(pid: u32) -> Result<(), ProcessTerminationFailure> {
+fn check_pid_value_can_be_terminated(pid: u32) -> Result<(), ProcessTerminationFailure> {
     if let Some(reason) = protected_system_process_reason(pid) {
         return Err(ProcessTerminationFailure {
             pid,
@@ -74,17 +75,62 @@ fn check_pid_can_be_terminated(pid: u32) -> Result<(), ProcessTerminationFailure
         });
     }
 
-    if let Ok((process_name, _)) = get_process_info(pid) {
-        if let Some(reason) = protected_process_name_reason(&process_name) {
-            return Err(ProcessTerminationFailure {
-                pid,
-                kind: ProcessTerminationFailureKind::ProtectedProcess,
-                reason: format!("protected process name {reason}"),
-            });
+    Ok(())
+}
+
+fn open_process_for_termination(pid: u32) -> Result<SafeHandle, ProcessTerminationFailure> {
+    // SAFETY: OpenProcess is called with a validated numeric PID. The returned
+    // owned handle is immediately wrapped in SafeHandle and closed on every exit.
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            false,
+            pid,
+        )
+    }
+    .map_err(|err| ProcessTerminationFailure {
+        pid,
+        kind: ProcessTerminationFailureKind::OpenProcess,
+        reason: err.to_string(),
+    })?;
+
+    SafeHandle::new(handle).map_err(|err| ProcessTerminationFailure {
+        pid,
+        kind: ProcessTerminationFailureKind::OpenProcess,
+        reason: err.to_string(),
+    })
+}
+
+fn check_open_process_can_be_terminated(
+    pid: u32,
+    process_handle: &SafeHandle,
+) -> Result<ProcessIdentity, ProcessTerminationFailure> {
+    let identity = get_process_identity_by_handle(process_handle.as_raw()).map_err(|err| {
+        ProcessTerminationFailure {
+            pid,
+            kind: ProcessTerminationFailureKind::StaleProcessIdentity,
+            reason: format!("failed to read identity from the opened process handle: {err}"),
         }
+    })?;
+
+    if let Some(reason) = protected_process_name_reason(&identity.process_name) {
+        return Err(ProcessTerminationFailure {
+            pid,
+            kind: ProcessTerminationFailureKind::ProtectedProcess,
+            reason: format!("protected process name {reason}"),
+        });
     }
 
-    Ok(())
+    Ok(identity)
+}
+
+fn open_checked_process(
+    pid: u32,
+) -> Result<(SafeHandle, ProcessIdentity), ProcessTerminationFailure> {
+    check_pid_value_can_be_terminated(pid)?;
+    let process_handle = open_process_for_termination(pid)?;
+    let identity = check_open_process_can_be_terminated(pid, &process_handle)?;
+    Ok((process_handle, identity))
 }
 
 fn normalize_process_identity(value: &str) -> String {
@@ -95,41 +141,52 @@ fn normalize_process_identity(value: &str) -> String {
 }
 
 fn process_identity_matches_snapshot(
-    pid: u32,
     expected: &ProcessInfo,
+    current: &ProcessIdentity,
 ) -> Result<(), ProcessTerminationFailure> {
-    let (current_name, current_exe_path) =
-        get_process_info(pid).map_err(|err| ProcessTerminationFailure {
-            pid,
+    let Some(expected_instance_id) = expected.process_instance_id else {
+        return Err(ProcessTerminationFailure {
+            pid: expected.pid,
             kind: ProcessTerminationFailureKind::StaleProcessIdentity,
-            reason: format!("failed to read current process identity: {err}"),
-        })?;
+            reason: "scan result does not contain a stable process instance identifier".to_string(),
+        });
+    };
+
+    if expected_instance_id != current.creation_time {
+        return Err(ProcessTerminationFailure {
+            pid: expected.pid,
+            kind: ProcessTerminationFailureKind::StaleProcessIdentity,
+            reason: "PID now refers to a different process instance".to_string(),
+        });
+    }
 
     if !expected.process_exe_path.is_empty()
-        && !current_exe_path.is_empty()
+        && !current.process_exe_path.is_empty()
         && normalize_process_identity(&expected.process_exe_path)
-            != normalize_process_identity(&current_exe_path)
+            != normalize_process_identity(&current.process_exe_path)
     {
         return Err(ProcessTerminationFailure {
-            pid,
+            pid: expected.pid,
             kind: ProcessTerminationFailureKind::StaleProcessIdentity,
             reason: format!(
                 "expected executable path '{}', found '{}'",
-                expected.process_exe_path, current_exe_path
+                expected.process_exe_path, current.process_exe_path
             ),
         });
     }
 
     if expected.process_exe_path.is_empty()
         && !expected.process_name.is_empty()
-        && !current_name.eq_ignore_ascii_case(&expected.process_name)
+        && !current
+            .process_name
+            .eq_ignore_ascii_case(&expected.process_name)
     {
         return Err(ProcessTerminationFailure {
-            pid,
+            pid: expected.pid,
             kind: ProcessTerminationFailureKind::StaleProcessIdentity,
             reason: format!(
                 "expected process name '{}', found '{}'",
-                expected.process_name, current_name
+                expected.process_name, current.process_name
             ),
         });
     }
@@ -184,51 +241,33 @@ fn process_still_holds_snapshot_locks(
     })
 }
 
-fn terminate_checked_process(pid: u32) -> Result<(), ProcessTerminationFailure> {
-    use windows::Win32::System::Threading::PROCESS_TERMINATE;
-
-    // SAFETY: `pid` has passed the safety checks above. OpenProcess returns an
-    // owned process HANDLE on success, wrapped by `HandleWrapper`; TerminateProcess
-    // is called only with that live handle.
-    unsafe {
-        let process_handle = OpenProcess(PROCESS_TERMINATE, false, pid).map_err(|err| {
-            ProcessTerminationFailure {
-                pid,
-                kind: ProcessTerminationFailureKind::OpenProcess,
-                reason: err.to_string(),
-            }
-        })?;
-        if process_handle.is_invalid() {
-            return Err(ProcessTerminationFailure {
-                pid,
-                kind: ProcessTerminationFailureKind::OpenProcess,
-                reason: "OpenProcess returned an invalid handle".to_string(),
-            });
-        }
-        let process_handle = HandleWrapper::new(process_handle);
-
-        if let Err(e) = TerminateProcess(process_handle.get(), 1) {
-            return Err(ProcessTerminationFailure {
-                pid,
-                kind: ProcessTerminationFailureKind::TerminateProcess,
-                reason: e.to_string(),
-            });
-        }
-
-        Ok(())
+fn terminate_checked_process(
+    pid: u32,
+    process_handle: &SafeHandle,
+) -> Result<(), ProcessTerminationFailure> {
+    // SAFETY: `process_handle` is the same live handle used for process identity
+    // validation and was opened with PROCESS_TERMINATE access.
+    if let Err(err) = unsafe { TerminateProcess(process_handle.as_raw(), 1) } {
+        return Err(ProcessTerminationFailure {
+            pid,
+            kind: ProcessTerminationFailureKind::TerminateProcess,
+            reason: err.to_string(),
+        });
     }
+
+    Ok(())
 }
 
 fn terminate_process_by_pid_detailed(pid: u32) -> Result<(), ProcessTerminationFailure> {
-    check_pid_can_be_terminated(pid)?;
-    terminate_checked_process(pid)
+    let (process_handle, _) = open_checked_process(pid)?;
+    terminate_checked_process(pid, &process_handle)
 }
 
 fn terminate_process_from_snapshot(process: &ProcessInfo) -> Result<(), ProcessTerminationFailure> {
-    check_pid_can_be_terminated(process.pid)?;
-    process_identity_matches_snapshot(process.pid, process)?;
+    let (process_handle, current_identity) = open_checked_process(process.pid)?;
+    process_identity_matches_snapshot(process, &current_identity)?;
     process_still_holds_snapshot_locks(process)?;
-    terminate_checked_process(process.pid)
+    terminate_checked_process(process.pid, &process_handle)
 }
 
 fn terminate_process_by_pid(pid: u32) -> WholockResult<()> {
@@ -280,9 +319,9 @@ pub fn unlock_process(pid: u32) -> WholockResult<()> {
 /// Terminates all processes in a lock query result.
 ///
 /// Each process is attempted independently and the returned vector contains one
-/// result per unique PID. Before termination, this revalidates that the PID still
-/// identifies the same executable and still appears in a fresh lock query for the
-/// recorded locked paths.
+/// result per unique PID. Before termination, this opens a stable process handle,
+/// verifies the scan-time process instance and executable identity through that
+/// handle, and confirms the process still appears in a fresh lock query.
 ///
 /// # Arguments
 ///
@@ -342,6 +381,34 @@ pub fn unlock_processes(processes: &[ProcessInfo]) -> Vec<UnlockProcessResult> {
 mod tests {
     use super::*;
 
+    fn process_snapshot(
+        pid: u32,
+        process_name: &str,
+        process_exe_path: &str,
+        process_instance_id: Option<u64>,
+    ) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            process_name: process_name.to_string(),
+            process_exe_path: process_exe_path.to_string(),
+            domain_username: String::new(),
+            locked_file: vec![r"C:\data\locked.txt".to_string()],
+            process_instance_id,
+        }
+    }
+
+    fn process_identity(
+        process_name: &str,
+        process_exe_path: &str,
+        creation_time: u64,
+    ) -> ProcessIdentity {
+        ProcessIdentity {
+            process_name: process_name.to_string(),
+            process_exe_path: process_exe_path.to_string(),
+            creation_time,
+        }
+    }
+
     #[test]
     fn test_unlock_processes_empty() {
         assert!(unlock_processes(&[]).is_empty());
@@ -350,20 +417,8 @@ mod tests {
     #[test]
     fn test_unlock_processes_reports_invalid_pid_once() {
         let processes = vec![
-            ProcessInfo {
-                pid: u32::MAX,
-                process_name: "missing.exe".to_string(),
-                process_exe_path: String::new(),
-                domain_username: String::new(),
-                locked_file: Vec::new(),
-            },
-            ProcessInfo {
-                pid: u32::MAX,
-                process_name: "missing-again.exe".to_string(),
-                process_exe_path: String::new(),
-                domain_username: String::new(),
-                locked_file: Vec::new(),
-            },
+            process_snapshot(u32::MAX, "missing.exe", "", None),
+            process_snapshot(u32::MAX, "missing-again.exe", "", None),
         ];
 
         let results = unlock_processes(&processes);
@@ -417,15 +472,10 @@ mod tests {
 
     #[test]
     fn test_process_identity_matches_snapshot_detects_name_change() {
-        let process = ProcessInfo {
-            pid: std::process::id(),
-            process_name: "definitely-not-current.exe".to_string(),
-            process_exe_path: String::new(),
-            domain_username: String::new(),
-            locked_file: vec![r"C:\data\locked.txt".to_string()],
-        };
+        let process = process_snapshot(42, "expected.exe", "", Some(100));
+        let current = process_identity("replacement.exe", "", 100);
 
-        let result = process_identity_matches_snapshot(process.pid, &process);
+        let result = process_identity_matches_snapshot(&process, &current);
 
         assert!(matches!(
             result,
@@ -437,14 +487,49 @@ mod tests {
     }
 
     #[test]
+    fn test_process_identity_matches_snapshot_detects_pid_reuse() {
+        let process = process_snapshot(42, "worker.exe", r"C:\apps\worker.exe", Some(100));
+        let current = process_identity("worker.exe", r"C:\apps\worker.exe", 200);
+
+        let result = process_identity_matches_snapshot(&process, &current);
+
+        assert!(matches!(
+            result,
+            Err(ProcessTerminationFailure {
+                kind: ProcessTerminationFailureKind::StaleProcessIdentity,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_process_identity_matches_snapshot_requires_instance_id() {
+        let process = process_snapshot(42, "worker.exe", r"C:\apps\worker.exe", None);
+        let current = process_identity("worker.exe", r"C:\apps\worker.exe", 100);
+
+        let result = process_identity_matches_snapshot(&process, &current);
+
+        assert!(matches!(
+            result,
+            Err(ProcessTerminationFailure {
+                kind: ProcessTerminationFailureKind::StaleProcessIdentity,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_process_identity_matches_snapshot_accepts_same_instance() {
+        let process = process_snapshot(42, "worker.exe", r"C:\apps\worker.exe", Some(100));
+        let current = process_identity("worker.exe", r"C:\apps\worker.exe", 100);
+
+        assert!(process_identity_matches_snapshot(&process, &current).is_ok());
+    }
+
+    #[test]
     fn test_process_still_holds_snapshot_locks_rejects_empty_snapshot() {
-        let process = ProcessInfo {
-            pid: std::process::id(),
-            process_name: String::new(),
-            process_exe_path: String::new(),
-            domain_username: String::new(),
-            locked_file: Vec::new(),
-        };
+        let mut process = process_snapshot(std::process::id(), "", "", Some(100));
+        process.locked_file.clear();
 
         let result = process_still_holds_snapshot_locks(&process);
 
@@ -459,13 +544,7 @@ mod tests {
 
     #[test]
     fn test_unlock_processes_reports_protected_system_pid() {
-        let processes = vec![ProcessInfo {
-            pid: 4,
-            process_name: "System".to_string(),
-            process_exe_path: String::new(),
-            domain_username: String::new(),
-            locked_file: Vec::new(),
-        }];
+        let processes = vec![process_snapshot(4, "System", "", Some(100))];
 
         let results = unlock_processes(&processes);
 

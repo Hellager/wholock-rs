@@ -111,6 +111,7 @@ fn main() -> WholockResult<()> {
 ### Critical Requirements
 - 🛑 **Elevation Optional** - Administrator/debug privilege improves scan completeness
 - ⚠️ **Handle Validation** - Handle type checks before path probing
+- 🔐 **Stable Termination** - Process creation identity prevents terminating a reused PID
 - 🔄 **Cleanup Guarantees** - RAII pattern for system handles
 
 ### System Compatibility

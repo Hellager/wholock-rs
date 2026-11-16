@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 use wholock::ProcessInfo;
-use wholock::{unlock_process, who_locks_file};
+use wholock::{unlock_process, unlock_processes, who_locks_file};
 
 const LOCK_HELPER_PATH_ENV: &str = "WHOLOCK_E2E_LOCK_PATH";
 const LOCK_HELPER_READY_ENV: &str = "WHOLOCK_E2E_READY_PATH";
@@ -90,13 +90,19 @@ fn test_find_locked_file_by_helper_process() {
             .any(|f| f.contains("locked.txt"))
     );
 
-    unlock_process(helper_process.pid).unwrap();
+    let unlock_results = unlock_processes(std::slice::from_ref(helper_process));
+    assert_eq!(unlock_results.len(), 1);
+    assert!(
+        unlock_results[0].is_success(),
+        "checked unlock failed: {:?}",
+        unlock_results[0].failure
+    );
     assert!(
         wait_until(Duration::from_secs(5), || child
             .try_wait()
             .unwrap()
             .is_some()),
-        "lock helper should exit after unlock_process terminates it"
+        "lock helper should exit after checked termination"
     );
 
     drop(dir);

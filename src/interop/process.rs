@@ -1,10 +1,12 @@
 use crate::{WholockResult, error::WholockError, error::get_win32_error_message};
 use std::{ffi::OsString, mem, os::windows::ffi::OsStringExt};
-use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HMODULE, MAX_PATH, WIN32_ERROR};
+use windows::Win32::Foundation::{
+    ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE, HMODULE, MAX_PATH, WIN32_ERROR,
+};
 use windows::Win32::System::ProcessStatus::{EnumProcessModules, GetModuleFileNameExW};
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
-    QueryFullProcessImageNameW,
+    GetProcessTimes, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_VM_READ, QueryFullProcessImageNameW,
 };
 use windows::core::PWSTR;
 
@@ -13,6 +15,13 @@ use super::handle::SafeHandle;
 
 const INITIAL_MODULE_CAPACITY: usize = 256;
 const MAX_DYNAMIC_PATH_CAPACITY: usize = 32 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessIdentity {
+    pub(crate) process_name: String,
+    pub(crate) process_exe_path: String,
+    pub(crate) creation_time: u64,
+}
 
 #[allow(dead_code)]
 pub(crate) fn build_process_name_dict() -> WholockResult<std::collections::HashMap<usize, String>> {
@@ -58,9 +67,7 @@ fn next_path_capacity(current: usize) -> WholockResult<usize> {
         .min(MAX_DYNAMIC_PATH_CAPACITY))
 }
 
-unsafe fn query_full_process_image_path(
-    handle: windows::Win32::Foundation::HANDLE,
-) -> WholockResult<String> {
+unsafe fn query_full_process_image_path(handle: HANDLE) -> WholockResult<String> {
     let mut buffer = vec![0u16; MAX_PATH as usize + 1];
 
     loop {
@@ -87,6 +94,31 @@ unsafe fn query_full_process_image_path(
     }
 }
 
+fn filetime_value(value: FILETIME) -> u64 {
+    (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
+}
+
+unsafe fn query_process_creation_time(handle: HANDLE) -> WholockResult<u64> {
+    let mut creation_time = FILETIME::default();
+    let mut exit_time = FILETIME::default();
+    let mut kernel_time = FILETIME::default();
+    let mut user_time = FILETIME::default();
+
+    // SAFETY: `handle` is a live process handle with query access. All output
+    // pointers refer to initialized writable FILETIME values for this call.
+    unsafe {
+        GetProcessTimes(
+            handle,
+            &mut creation_time,
+            &mut exit_time,
+            &mut kernel_time,
+            &mut user_time,
+        )?;
+    }
+
+    Ok(filetime_value(creation_time))
+}
+
 unsafe fn module_path_for_handle(
     process: windows::Win32::Foundation::HANDLE,
     module: HMODULE,
@@ -111,10 +143,26 @@ unsafe fn module_path_for_handle(
     }
 }
 
-pub(crate) fn get_process_info(pid: u32) -> WholockResult<(String, String)> {
+pub(crate) fn get_process_identity_by_handle(handle: HANDLE) -> WholockResult<ProcessIdentity> {
+    // SAFETY: The caller provides a live process handle with query access. Both
+    // helpers only read process metadata into owned Rust values.
+    unsafe {
+        let process_exe_path = query_full_process_image_path(handle)?;
+        let process_name = extract_filename(&process_exe_path)?;
+        let creation_time = query_process_creation_time(handle)?;
+
+        Ok(ProcessIdentity {
+            process_name,
+            process_exe_path,
+            creation_time,
+        })
+    }
+}
+
+pub(crate) fn get_process_identity(pid: u32) -> WholockResult<ProcessIdentity> {
     // SAFETY: OpenProcess returns an owned process handle for `pid` on success
-    // and that handle is wrapped in SafeHandle. QueryFullProcessImageNameW
-    // writes into `buffer`, whose size is supplied via `size`.
+    // and that handle is wrapped in SafeHandle. Metadata is queried through the
+    // same live handle so the image path and creation time identify one process.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).map_err(|e| {
             WholockError::process(format!(
@@ -125,11 +173,7 @@ pub(crate) fn get_process_info(pid: u32) -> WholockResult<(String, String)> {
         })?;
 
         let safe_handle = SafeHandle::new(handle)?;
-
-        let path_str = query_full_process_image_path(safe_handle.as_raw())?;
-        let exe_name = extract_filename(&path_str)?;
-
-        Ok((exe_name, path_str))
+        get_process_identity_by_handle(safe_handle.as_raw())
     }
 }
 
@@ -254,12 +298,13 @@ mod tests {
     #[test]
     fn test_current_process() {
         let pid = std::process::id();
-        let (name, path) = get_process_info(pid).unwrap();
-        assert!(!name.is_empty());
-        assert!(std::path::Path::new(&path).exists());
+        let identity = get_process_identity(pid).unwrap();
+        assert!(!identity.process_name.is_empty());
+        assert!(std::path::Path::new(&identity.process_exe_path).exists());
+        assert_ne!(identity.creation_time, 0);
         assert_eq!(
-            name,
-            std::path::Path::new(&path)
+            identity.process_name,
+            std::path::Path::new(&identity.process_exe_path)
                 .file_name()
                 .unwrap()
                 .to_str()

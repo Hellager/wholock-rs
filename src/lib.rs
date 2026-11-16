@@ -96,6 +96,7 @@
 //!
 //! - Validates input paths before scanning
 //! - Closes native handles through internal RAII guards
+//! - Pins termination to one process handle and rejects reused process IDs
 //! - Revalidates process identity and lock state before checked termination
 //!
 //! ## Best Practices

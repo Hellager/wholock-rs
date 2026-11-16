@@ -7,8 +7,10 @@ use std::time::Duration;
 /// Describes a process that currently holds one or more matching file locks.
 ///
 /// Values are returned by [`who_locks_file`](crate::who_locks_file) and
-/// [`scan_locks`](crate::scan_locks).
+/// [`scan_locks`](crate::scan_locks). Scan results retain private process-instance
+/// metadata so [`unlock_processes`](crate::unlock_processes) can reject reused PIDs.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ProcessInfo {
     /// Process identifier reported by Windows.
     pub pid: u32,
@@ -20,6 +22,8 @@ pub struct ProcessInfo {
     pub domain_username: String,
     /// Matching file or module paths held by the process.
     pub locked_file: Vec<String>,
+    /// Opaque Windows process creation value used to reject reused PIDs.
+    pub(crate) process_instance_id: Option<u64>,
 }
 
 /// Options controlling how file lock scans are performed.
@@ -333,6 +337,7 @@ mod tests {
             process_exe_path: String::new(),
             domain_username: String::new(),
             locked_file: vec![format!(r"C:\data\locked-{pid}.txt")],
+            process_instance_id: None,
         }
     }
 

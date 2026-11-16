@@ -3,7 +3,7 @@ use crate::error::{LockScanWarning, LockScanWarningKind, WholockError, get_win32
 use crate::interop::{
     LockedPathMatchers, PROCESS_ACCESS_RIGHTS_DUP_HANDLE, PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
     ResolvedFilePath, SYSTEM_EXTENDED_HANDLE_INFORMATION, duplicate_handle_value,
-    get_file_paths_by_handle, get_handle_owner_info, get_handle_table, get_process_info,
+    get_file_paths_by_handle, get_handle_owner_info, get_handle_table, get_process_identity,
     get_process_module_paths, is_disk_file_handle, kernel_path_for_path,
     query_system_information_buffer,
 };
@@ -244,16 +244,21 @@ impl ProcessLockCollector {
                 String::new()
             }
         };
-        let (process_name, process_exe_path) = match get_process_info(self.pid) {
-            Ok(info) => info,
-            Err(err) => {
-                warnings.push(process_metadata_warning(
-                    self.pid,
-                    format!("failed to query process image metadata: {err}"),
-                ));
-                (String::new(), String::new())
-            }
-        };
+        let (process_name, process_exe_path, process_instance_id) =
+            match get_process_identity(self.pid) {
+                Ok(identity) => (
+                    identity.process_name,
+                    identity.process_exe_path,
+                    Some(identity.creation_time),
+                ),
+                Err(err) => {
+                    warnings.push(process_metadata_warning(
+                        self.pid,
+                        format!("failed to query process image metadata: {err}"),
+                    ));
+                    (String::new(), String::new(), None)
+                }
+            };
 
         ProcessInfo {
             pid: self.pid,
@@ -261,6 +266,7 @@ impl ProcessLockCollector {
             process_exe_path,
             domain_username,
             locked_file: self.locked_files.into_iter().collect(),
+            process_instance_id,
         }
     }
 }
