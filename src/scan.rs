@@ -15,7 +15,7 @@ use itertools::Itertools;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
     mpsc::{self, RecvTimeoutError},
 };
 use std::time::Duration;
@@ -76,31 +76,119 @@ struct HandleProbeRequest {
 type HandleProbeReply =
     Result<WholockResult<Option<ResolvedFilePath>>, Box<dyn std::any::Any + Send>>;
 
-struct HandleProbeWorker {
-    probe: Arc<HandleProbeFunction>,
-    sender: Option<mpsc::Sender<HandleProbeRequest>>,
+struct HandleProbeTimeoutBudget {
+    max_abandoned_workers: usize,
+    state: Mutex<HandleProbeTimeoutBudgetState>,
+    slot_available: Condvar,
+}
+
+#[derive(Default)]
+struct HandleProbeTimeoutBudgetState {
+    active_probes: usize,
     abandoned_workers: usize,
 }
 
+impl HandleProbeTimeoutBudget {
+    fn new(max_abandoned_workers: usize) -> Self {
+        Self {
+            max_abandoned_workers,
+            state: Mutex::new(HandleProbeTimeoutBudgetState::default()),
+            slot_available: Condvar::new(),
+        }
+    }
+
+    fn reserve(self: &Arc<Self>) -> Option<HandleProbeTimeoutReservation> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if state.abandoned_workers >= self.max_abandoned_workers {
+                return None;
+            }
+
+            let available_slots = self.max_abandoned_workers - state.abandoned_workers;
+            if state.active_probes < available_slots {
+                state.active_probes += 1;
+                break;
+            }
+
+            state = self
+                .slot_available
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        drop(state);
+
+        Some(HandleProbeTimeoutReservation {
+            budget: Arc::clone(self),
+            abandoned: false,
+        })
+    }
+}
+
+struct HandleProbeTimeoutReservation {
+    budget: Arc<HandleProbeTimeoutBudget>,
+    abandoned: bool,
+}
+
+impl HandleProbeTimeoutReservation {
+    fn abandon(mut self) {
+        self.abandoned = true;
+    }
+}
+
+impl Drop for HandleProbeTimeoutReservation {
+    fn drop(&mut self) {
+        let mut state = self
+            .budget
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(state.active_probes > 0);
+        state.active_probes -= 1;
+        if self.abandoned {
+            state.abandoned_workers += 1;
+        }
+        drop(state);
+        self.budget.slot_available.notify_all();
+    }
+}
+
+struct HandleProbeWorker {
+    probe: Arc<HandleProbeFunction>,
+    sender: Option<mpsc::Sender<HandleProbeRequest>>,
+    timeout_budget: Arc<HandleProbeTimeoutBudget>,
+}
+
 impl HandleProbeWorker {
+    #[cfg(test)]
     fn new<F>(probe: F) -> Self
+    where
+        F: Fn(HANDLE, usize) -> WholockResult<Option<ResolvedFilePath>> + Send + Sync + 'static,
+    {
+        Self::with_timeout_budget(
+            probe,
+            Arc::new(HandleProbeTimeoutBudget::new(
+                MAX_ABANDONED_HANDLE_PROBE_WORKERS,
+            )),
+        )
+    }
+
+    fn with_timeout_budget<F>(probe: F, timeout_budget: Arc<HandleProbeTimeoutBudget>) -> Self
     where
         F: Fn(HANDLE, usize) -> WholockResult<Option<ResolvedFilePath>> + Send + Sync + 'static,
     {
         Self {
             probe: Arc::new(probe),
             sender: None,
-            abandoned_workers: 0,
+            timeout_budget,
         }
     }
 
     fn ensure_worker(&mut self) -> Result<(), HandleProbeOutcome> {
         if self.sender.is_some() {
             return Ok(());
-        }
-
-        if self.abandoned_workers >= MAX_ABANDONED_HANDLE_PROBE_WORKERS {
-            return Err(HandleProbeOutcome::WorkerLimitReached);
         }
 
         let (sender, receiver) = mpsc::channel::<HandleProbeRequest>();
@@ -142,6 +230,10 @@ impl HandleProbeWorker {
             return HandleProbeOutcome::TimedOut;
         }
 
+        let Some(timeout_reservation) = self.timeout_budget.reserve() else {
+            return HandleProbeOutcome::WorkerLimitReached;
+        };
+
         if let Err(outcome) = self.ensure_worker() {
             return outcome;
         }
@@ -168,7 +260,7 @@ impl HandleProbeWorker {
             Ok(Err(_)) => HandleProbeOutcome::WorkerPanicked,
             Err(RecvTimeoutError::Timeout) => {
                 self.sender = None;
-                self.abandoned_workers += 1;
+                timeout_reservation.abandon();
                 HandleProbeOutcome::TimedOut
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -298,6 +390,9 @@ fn collect_handle_locks_parallel(
 
     let worker_count = handle_scan_worker_count(handle_groups.len());
     let queue = Arc::new(Mutex::new(VecDeque::from(handle_groups)));
+    let timeout_budget = Arc::new(HandleProbeTimeoutBudget::new(
+        MAX_ABANDONED_HANDLE_PROBE_WORKERS,
+    ));
     let (tx, rx) = std::sync::mpsc::channel();
     let mut workers = Vec::with_capacity(worker_count);
     let mut startup_warnings = Vec::new();
@@ -306,10 +401,14 @@ fn collect_handle_locks_parallel(
         let queue = Arc::clone(&queue);
         let tx = tx.clone();
         let matchers = Arc::clone(&matchers);
+        let timeout_budget = Arc::clone(&timeout_budget);
         let worker = std::thread::Builder::new()
             .name(format!("wholock-handle-scan-{worker_index}"))
             .spawn(move || {
-                let mut probe_worker = HandleProbeWorker::new(probe_handle_path_blocking);
+                let mut probe_worker = HandleProbeWorker::with_timeout_budget(
+                    probe_handle_path_blocking,
+                    timeout_budget,
+                );
                 loop {
                     let task = match queue.lock() {
                         Ok(mut queue) => queue.pop_front(),
@@ -790,6 +889,7 @@ mod tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
     fn scan_processes(path: &str) -> Vec<ProcessInfo> {
@@ -943,6 +1043,94 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_probe_workers_share_timeout_budget() {
+        let timeout_budget = Arc::new(HandleProbeTimeoutBudget::new(1));
+        let mut timed_out_worker = HandleProbeWorker::with_timeout_budget(
+            |_, _| {
+                std::thread::sleep(Duration::from_millis(50));
+                Ok(None)
+            },
+            Arc::clone(&timeout_budget),
+        );
+        let mut limited_worker =
+            HandleProbeWorker::with_timeout_budget(|_, _| Ok(None), Arc::clone(&timeout_budget));
+
+        assert_eq!(
+            timed_out_worker.probe(std::process::id(), 1, Duration::from_millis(1)),
+            HandleProbeOutcome::TimedOut
+        );
+        assert_eq!(
+            limited_worker.probe(std::process::id(), 2, Duration::from_secs(1)),
+            HandleProbeOutcome::WorkerLimitReached
+        );
+    }
+
+    #[test]
+    fn test_handle_probe_budget_waits_for_active_probe() {
+        let timeout_budget = Arc::new(HandleProbeTimeoutBudget::new(1));
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let worker_started = Arc::clone(&started);
+        let worker_release = Arc::clone(&release);
+        let mut active_worker = HandleProbeWorker::with_timeout_budget(
+            move |_, _| {
+                worker_started.wait();
+                worker_release.wait();
+                Ok(None)
+            },
+            Arc::clone(&timeout_budget),
+        );
+        let active_probe = std::thread::spawn(move || {
+            active_worker.probe(std::process::id(), 1, Duration::from_secs(1))
+        });
+        started.wait();
+
+        let mut waiting_worker =
+            HandleProbeWorker::with_timeout_budget(|_, _| Ok(None), Arc::clone(&timeout_budget));
+        let waiting_probe = std::thread::spawn(move || {
+            waiting_worker.probe(std::process::id(), 2, Duration::from_secs(1))
+        });
+
+        release.wait();
+        assert_eq!(
+            active_probe.join().expect("active probe should not panic"),
+            HandleProbeOutcome::NoMatch
+        );
+        assert_eq!(
+            waiting_probe
+                .join()
+                .expect("waiting probe should not panic"),
+            HandleProbeOutcome::NoMatch
+        );
+    }
+
+    #[test]
+    fn test_zero_handle_probe_timeout_does_not_consume_budget() {
+        let timeout_budget = Arc::new(HandleProbeTimeoutBudget::new(1));
+        let probe_calls = Arc::new(AtomicUsize::new(0));
+        let worker_probe_calls = Arc::clone(&probe_calls);
+        let mut worker = HandleProbeWorker::with_timeout_budget(
+            move |_, _| {
+                worker_probe_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(None)
+            },
+            Arc::clone(&timeout_budget),
+        );
+
+        assert_eq!(
+            worker.probe(std::process::id(), 1, Duration::ZERO),
+            HandleProbeOutcome::TimedOut
+        );
+        assert!(worker.sender.is_none());
+        assert_eq!(probe_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            worker.probe(std::process::id(), 1, Duration::from_secs(1)),
+            HandleProbeOutcome::NoMatch
+        );
+        assert_eq!(probe_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn test_handle_probe_worker_panic_returns_panic_outcome() {
         let mut worker = HandleProbeWorker::new(|_, _| {
             panic!("deliberate handle probe panic");
@@ -1060,7 +1248,6 @@ mod tests {
                 kernel_path_error: None,
             })
         );
-        assert_eq!(worker.abandoned_workers, 0);
     }
 
     #[test]
