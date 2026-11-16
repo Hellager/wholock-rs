@@ -14,8 +14,6 @@ find out who's locking your file on windows
 """
 
 [dependencies]
-itertools = "0.15.0"
-sysinfo = "0.39.5"
 thiserror = "2.0.18"
 
 [dependencies.windows]

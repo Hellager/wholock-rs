@@ -12,7 +12,6 @@ use crate::{
     WholockResult,
     types::{LockMatch, LockMatchSource, LockScanOptions, LockScanResult, ProcessInfo},
 };
-use itertools::Itertools;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::{
@@ -675,7 +674,12 @@ fn scan_process_handles(
     }
 
     if !probe_failures.is_empty() {
-        let details = probe_failures.iter().take(3).join("; ");
+        let details = probe_failures
+            .iter()
+            .take(3)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("; ");
         let suffix = (probe_failures.len() > 3).then_some("; additional failures omitted");
         warnings.push(LockScanWarning::new(
             Some(pid),
@@ -689,7 +693,12 @@ fn scan_process_handles(
     }
 
     if !kernel_path_failures.is_empty() {
-        let details = kernel_path_failures.iter().take(3).join("; ");
+        let details = kernel_path_failures
+            .iter()
+            .take(3)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("; ");
         let suffix = if kernel_path_failures.len() > 3 {
             "; additional failures omitted"
         } else {
@@ -845,13 +854,15 @@ where
     match query_system_information_buffer(SYSTEM_EXTENDED_HANDLE_INFORMATION) {
         Ok(buffer) => match get_handle_table(&buffer) {
             Ok(table) => {
-                let handle_groups = table
-                    .iter()
-                    .filter_map(|handle| {
-                        let pid = u32::try_from(handle.unique_process_id()).ok()?;
-                        Some((pid, handle.handle_value_raw()))
-                    })
-                    .into_group_map();
+                let mut handle_groups = BTreeMap::<u32, Vec<usize>>::new();
+                for handle in table.iter() {
+                    if let Ok(pid) = u32::try_from(handle.unique_process_id()) {
+                        handle_groups
+                            .entry(pid)
+                            .or_default()
+                            .push(handle.handle_value_raw());
+                    }
+                }
 
                 let (handle_results, handle_warnings) = collect_handle_locks_parallel(
                     handle_groups.into_iter().collect(),
@@ -905,7 +916,12 @@ where
             }
 
             if !kernel_path_failures.is_empty() {
-                let details = kernel_path_failures.iter().take(2).join("; ");
+                let details = kernel_path_failures
+                    .iter()
+                    .take(2)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("; ");
                 let suffix = if kernel_path_failures.len() > 2 {
                     "; additional failures omitted"
                 } else {

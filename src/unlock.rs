@@ -7,20 +7,13 @@ use crate::types::{
     UnlockProcessResult,
 };
 use std::collections::BTreeSet;
-use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+use windows::Win32::Foundation::{
+    ERROR_INVALID_PARAMETER, GetLastError, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-
-fn sanitize_pid(pid: u32) -> WholockResult<()> {
-    let system = sysinfo::System::new_all();
-    if !system
-        .processes()
-        .contains_key(&sysinfo::Pid::from(pid as usize))
-    {
-        return Err(WholockError::InvalidPID(pid));
-    }
-    Ok(())
-}
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    TerminateProcess, WaitForSingleObject,
+};
 
 fn protected_system_process_reason(pid: u32) -> Option<&'static str> {
     if pid == std::process::id() {
@@ -67,38 +60,76 @@ fn check_pid_value_can_be_terminated(pid: u32) -> Result<(), ProcessTerminationF
         });
     }
 
-    if let Err(err) = sanitize_pid(pid) {
-        return Err(ProcessTerminationFailure {
-            pid,
-            kind: ProcessTerminationFailureKind::InvalidPid,
-            reason: err.to_string(),
-        });
-    }
-
     Ok(())
 }
 
+fn process_open_failure(pid: u32, error: windows::core::Error) -> ProcessTerminationFailure {
+    if error.code() == ERROR_INVALID_PARAMETER.to_hresult() {
+        return ProcessTerminationFailure {
+            pid,
+            kind: ProcessTerminationFailureKind::InvalidPid,
+            reason: WholockError::InvalidPID(pid).to_string(),
+        };
+    }
+
+    ProcessTerminationFailure {
+        pid,
+        kind: ProcessTerminationFailureKind::OpenProcess,
+        reason: error.to_string(),
+    }
+}
+
+fn check_process_is_running(
+    pid: u32,
+    process_handle: &SafeHandle,
+) -> Result<(), ProcessTerminationFailure> {
+    // SAFETY: `process_handle` is a live process handle opened with
+    // PROCESS_SYNCHRONIZE access. A zero timeout only queries its signaled state.
+    let wait_result = unsafe { WaitForSingleObject(process_handle.as_raw(), 0) };
+    match wait_result {
+        WAIT_TIMEOUT => Ok(()),
+        WAIT_OBJECT_0 => Err(ProcessTerminationFailure {
+            pid,
+            kind: ProcessTerminationFailureKind::InvalidPid,
+            reason: WholockError::InvalidPID(pid).to_string(),
+        }),
+        WAIT_FAILED => {
+            // SAFETY: GetLastError has no parameters and is called immediately
+            // after the failed wait on this thread.
+            let error = WholockError::from(unsafe { GetLastError() });
+            Err(ProcessTerminationFailure {
+                pid,
+                kind: ProcessTerminationFailureKind::OpenProcess,
+                reason: format!("failed to query whether the process is running: {error}"),
+            })
+        }
+        unexpected => Err(ProcessTerminationFailure {
+            pid,
+            kind: ProcessTerminationFailureKind::OpenProcess,
+            reason: format!("unexpected process wait result: {}", unexpected.0),
+        }),
+    }
+}
+
 fn open_process_for_termination(pid: u32) -> Result<SafeHandle, ProcessTerminationFailure> {
-    // SAFETY: OpenProcess is called with a validated numeric PID. The returned
-    // owned handle is immediately wrapped in SafeHandle and closed on every exit.
+    // SAFETY: OpenProcess accepts any u32 PID. The returned owned handle is
+    // immediately wrapped in SafeHandle and closed on every exit.
     let handle = unsafe {
         OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
             false,
             pid,
         )
     }
-    .map_err(|err| ProcessTerminationFailure {
+    .map_err(|error| process_open_failure(pid, error))?;
+
+    let process_handle = SafeHandle::new(handle).map_err(|err| ProcessTerminationFailure {
         pid,
         kind: ProcessTerminationFailureKind::OpenProcess,
         reason: err.to_string(),
     })?;
-
-    SafeHandle::new(handle).map_err(|err| ProcessTerminationFailure {
-        pid,
-        kind: ProcessTerminationFailureKind::OpenProcess,
-        reason: err.to_string(),
-    })
+    check_process_is_running(pid, &process_handle)?;
+    Ok(process_handle)
 }
 
 fn check_open_process_can_be_terminated(

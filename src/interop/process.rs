@@ -27,22 +27,6 @@ pub(crate) struct ProcessIdentity {
     pub(crate) creation_time: u64,
 }
 
-#[allow(dead_code)]
-pub(crate) fn build_process_name_dict() -> WholockResult<std::collections::HashMap<usize, String>> {
-    use sysinfo::System;
-
-    let mut sys = System::new_all();
-    sys.refresh_all();
-
-    let mut process_name_dict: std::collections::HashMap<usize, String> =
-        std::collections::HashMap::new();
-    for (pid, process) in sys.processes() {
-        process_name_dict.insert((*pid).into(), process.name().to_string_lossy().to_string());
-    }
-
-    Ok(process_name_dict)
-}
-
 fn convert_wide_buffer(buffer: &[u16], len: usize) -> WholockResult<String> {
     let os_str = OsString::from_wide(&buffer[..len]);
     os_str
@@ -298,14 +282,6 @@ pub(crate) fn get_process_module_paths(pid: u32) -> WholockResult<Vec<String>> {
 mod tests {
     use super::*;
     use crate::error::WholockError;
-
-    #[test]
-    fn test_build_process_name_dict() {
-        let result = build_process_name_dict();
-        assert!(result.is_ok());
-        let dict = result.unwrap();
-        assert!(!dict.is_empty());
-    }
 
     #[test]
     fn test_convert_wide_buffer() {
