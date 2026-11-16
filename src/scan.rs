@@ -15,15 +15,13 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
     mpsc::{self, RecvTimeoutError},
 };
 use std::time::Duration;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess};
 
-const MAX_ACTIVE_HANDLE_PROBE_WORKERS: usize = 32;
-static ACTIVE_HANDLE_PROBE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+const MAX_ABANDONED_HANDLE_PROBE_WORKERS: usize = 8;
 
 pub(crate) struct HandleWrapper(HANDLE);
 
@@ -53,30 +51,6 @@ impl Drop for HandleWrapper {
     }
 }
 
-struct ActiveHandleProbeWorkerGuard;
-
-impl Drop for ActiveHandleProbeWorkerGuard {
-    fn drop(&mut self) {
-        ACTIVE_HANDLE_PROBE_WORKERS.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-fn acquire_active_handle_probe_worker() -> Option<ActiveHandleProbeWorkerGuard> {
-    loop {
-        let current = ACTIVE_HANDLE_PROBE_WORKERS.load(Ordering::Acquire);
-        if current >= MAX_ACTIVE_HANDLE_PROBE_WORKERS {
-            return None;
-        }
-
-        if ACTIVE_HANDLE_PROBE_WORKERS
-            .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            return Some(ActiveHandleProbeWorkerGuard);
-        }
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 enum HandleProbeOutcome {
     Path(String),
@@ -88,63 +62,137 @@ enum HandleProbeOutcome {
     SpawnFailed(String),
 }
 
-fn run_handle_probe_with_timeout<F>(timeout: Duration, probe: F) -> HandleProbeOutcome
-where
-    F: FnOnce() -> WholockResult<Option<String>> + Send + 'static,
-{
-    if timeout.is_zero() {
-        return HandleProbeOutcome::TimedOut;
+type HandleProbeFunction =
+    dyn Fn(HANDLE, usize) -> WholockResult<Option<String>> + Send + Sync + 'static;
+
+struct HandleProbeRequest {
+    pid: u32,
+    source_handle: usize,
+    reply: mpsc::Sender<HandleProbeReply>,
+}
+
+type HandleProbeReply = Result<WholockResult<Option<String>>, Box<dyn std::any::Any + Send>>;
+
+struct HandleProbeWorker {
+    probe: Arc<HandleProbeFunction>,
+    sender: Option<mpsc::Sender<HandleProbeRequest>>,
+    abandoned_workers: usize,
+}
+
+impl HandleProbeWorker {
+    fn new<F>(probe: F) -> Self
+    where
+        F: Fn(HANDLE, usize) -> WholockResult<Option<String>> + Send + Sync + 'static,
+    {
+        Self {
+            probe: Arc::new(probe),
+            sender: None,
+            abandoned_workers: 0,
+        }
     }
 
-    let Some(active_worker) = acquire_active_handle_probe_worker() else {
-        return HandleProbeOutcome::WorkerLimitReached;
-    };
-    let (tx, rx) = mpsc::channel();
+    fn ensure_worker(&mut self) -> Result<(), HandleProbeOutcome> {
+        if self.sender.is_some() {
+            return Ok(());
+        }
 
-    let spawn_result = std::thread::Builder::new()
-        .name("wholock-handle-probe".into())
-        .spawn(move || {
-            let _active_worker = active_worker;
-            let result = std::panic::catch_unwind(AssertUnwindSafe(probe));
-            let _ = tx.send(result);
-        });
+        if self.abandoned_workers >= MAX_ABANDONED_HANDLE_PROBE_WORKERS {
+            return Err(HandleProbeOutcome::WorkerLimitReached);
+        }
 
-    if let Err(err) = spawn_result {
-        return HandleProbeOutcome::SpawnFailed(err.to_string());
+        let (sender, receiver) = mpsc::channel::<HandleProbeRequest>();
+        let probe = Arc::clone(&self.probe);
+        std::thread::Builder::new()
+            .name("wholock-handle-probe".into())
+            .spawn(move || {
+                let mut cached_owner_process: Option<(u32, HandleWrapper)> = None;
+                while let Ok(request) = receiver.recv() {
+                    if cached_owner_process
+                        .as_ref()
+                        .is_some_and(|(cached_pid, _)| *cached_pid != request.pid)
+                    {
+                        cached_owner_process = None;
+                    }
+
+                    if cached_owner_process.is_none() {
+                        cached_owner_process = open_handle_owner_process(request.pid);
+                    }
+
+                    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        cached_owner_process
+                            .as_ref()
+                            .map_or(Ok(None), |(_, handle)| {
+                                (probe)(handle.get(), request.source_handle)
+                            })
+                    }));
+                    let _ = request.reply.send(result);
+                }
+            })
+            .map_err(|err| HandleProbeOutcome::SpawnFailed(err.to_string()))?;
+
+        self.sender = Some(sender);
+        Ok(())
     }
 
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(Ok(Some(path)))) => HandleProbeOutcome::Path(path),
-        Ok(Ok(Ok(None) | Err(_))) => HandleProbeOutcome::NoMatch,
-        Ok(Err(_)) => HandleProbeOutcome::WorkerPanicked,
-        Err(RecvTimeoutError::Timeout) => HandleProbeOutcome::TimedOut,
-        Err(RecvTimeoutError::Disconnected) => HandleProbeOutcome::WorkerDisconnected,
+    fn probe(&mut self, pid: u32, source_handle: usize, timeout: Duration) -> HandleProbeOutcome {
+        if timeout.is_zero() {
+            return HandleProbeOutcome::TimedOut;
+        }
+
+        if let Err(outcome) = self.ensure_worker() {
+            return outcome;
+        }
+
+        let (reply, result) = mpsc::channel();
+        let request = HandleProbeRequest {
+            pid,
+            source_handle,
+            reply,
+        };
+
+        let Some(sender) = self.sender.as_ref() else {
+            return HandleProbeOutcome::WorkerDisconnected;
+        };
+        if sender.send(request).is_err() {
+            self.sender = None;
+            return HandleProbeOutcome::WorkerDisconnected;
+        }
+
+        match result.recv_timeout(timeout) {
+            Ok(Ok(Ok(Some(path)))) => HandleProbeOutcome::Path(path),
+            Ok(Ok(Ok(None) | Err(_))) => HandleProbeOutcome::NoMatch,
+            Ok(Err(_)) => HandleProbeOutcome::WorkerPanicked,
+            Err(RecvTimeoutError::Timeout) => {
+                self.sender = None;
+                self.abandoned_workers += 1;
+                HandleProbeOutcome::TimedOut
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.sender = None;
+                HandleProbeOutcome::WorkerDisconnected
+            }
+        }
     }
 }
 
-fn probe_handle_path_blocking(pid: u32, source_handle: usize) -> WholockResult<Option<String>> {
+fn open_handle_owner_process(pid: u32) -> Option<(u32, HandleWrapper)> {
     // SAFETY: OpenProcess is called with a PID read from the system handle table.
-    // The returned process HANDLE is owned by this worker and closed by
-    // `HandleWrapper` before the worker exits.
-    let Ok(handle_owner_process) = (unsafe {
-        OpenProcess(
-            PROCESS_ACCESS_RIGHTS_DUP_HANDLE | PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
-            false,
-            pid,
-        )
-    }) else {
-        return Ok(None);
-    };
-    let handle_owner_process = HandleWrapper::new(handle_owner_process);
-    if handle_owner_process.is_invalid() {
-        return Ok(None);
-    }
+    // The returned process HANDLE is owned by the probe worker and closed when
+    // the worker switches to another PID or exits.
+    let handle = unsafe { OpenProcess(PROCESS_ACCESS_RIGHTS_DUP_HANDLE, false, pid) }.ok()?;
+    let handle = HandleWrapper::new(handle);
+    (!handle.is_invalid()).then_some((pid, handle))
+}
 
+fn probe_handle_path_blocking(
+    handle_owner_process: HANDLE,
+    source_handle: usize,
+) -> WholockResult<Option<String>> {
     // SAFETY: GetCurrentProcess returns the documented pseudo-handle for the
     // current process. It must not be closed and is only passed to DuplicateHandle.
     let current_process = unsafe { GetCurrentProcess() };
     let Ok(dup_handle) =
-        duplicate_handle_value(current_process, handle_owner_process.get(), source_handle)
+        duplicate_handle_value(current_process, handle_owner_process, source_handle)
     else {
         return Ok(None);
     };
@@ -158,16 +206,6 @@ fn probe_handle_path_blocking(pid: u32, source_handle: usize) -> WholockResult<O
     }
 
     Ok(get_final_path_name_by_handle(&dup_handle.get()).ok())
-}
-
-fn probe_handle_path_with_timeout(
-    pid: u32,
-    source_handle: usize,
-    timeout: Duration,
-) -> HandleProbeOutcome {
-    run_handle_probe_with_timeout(timeout, move || {
-        probe_handle_path_blocking(pid, source_handle)
-    })
 }
 
 struct ProcessLockCollector {
@@ -241,14 +279,20 @@ fn collect_handle_locks_parallel(
         let tx = tx.clone();
         let matchers = Arc::clone(&matchers);
         workers.push(std::thread::spawn(move || {
+            let mut probe_worker = HandleProbeWorker::new(probe_handle_path_blocking);
             loop {
                 let task = queue.lock().ok().and_then(|mut queue| queue.pop_front());
                 let Some((pid, handle_values)) = task else {
                     break;
                 };
 
-                let scan_result =
-                    scan_process_handles(pid, &handle_values, &matchers, handle_probe_timeout);
+                let scan_result = scan_process_handles(
+                    pid,
+                    &handle_values,
+                    &matchers,
+                    handle_probe_timeout,
+                    &mut probe_worker,
+                );
                 let _ = tx.send(scan_result);
             }
         }));
@@ -306,6 +350,7 @@ fn scan_process_handles(
     handle_values: &[usize],
     matchers: &LockedPathMatchers,
     handle_probe_timeout: Duration,
+    probe_worker: &mut HandleProbeWorker,
 ) -> ProcessHandleScanResult {
     if let Err(warning) = verify_process_can_be_scanned(pid) {
         return ProcessHandleScanResult {
@@ -318,7 +363,7 @@ fn scan_process_handles(
     let mut warnings = Vec::new();
 
     for handle_value in handle_values {
-        match probe_handle_path_with_timeout(pid, *handle_value, handle_probe_timeout) {
+        match probe_worker.probe(pid, *handle_value, handle_probe_timeout) {
             HandleProbeOutcome::Path(full_name) => {
                 if matchers.matches(&full_name) {
                     locked_files.insert(full_name);
@@ -336,7 +381,7 @@ fn scan_process_handles(
             HandleProbeOutcome::WorkerLimitReached => warnings.push(LockScanWarning::new(
                 Some(pid),
                 LockScanWarningKind::HandleEnumeration,
-                "too many timed-out handle probes are still running",
+                "too many timed-out handle probe workers are still running",
             )),
             HandleProbeOutcome::WorkerDisconnected => warnings.push(LockScanWarning::new(
                 Some(pid),
@@ -374,13 +419,7 @@ fn verify_process_can_be_scanned(pid: u32) -> Result<(), LockScanWarning> {
     // SAFETY: OpenProcess is called with a concrete PID from the system handle
     // table. The returned process HANDLE is used only as a capability preflight
     // and is closed before any timeout-protected worker is spawned.
-    let Ok(handle) = (unsafe {
-        OpenProcess(
-            PROCESS_ACCESS_RIGHTS_DUP_HANDLE | PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
-            false,
-            pid,
-        )
-    }) else {
+    let Ok(handle) = (unsafe { OpenProcess(PROCESS_ACCESS_RIGHTS_DUP_HANDLE, false, pid) }) else {
         return Err(LockScanWarning::new(
             Some(pid),
             LockScanWarningKind::OpenProcess,
@@ -685,21 +724,40 @@ mod tests {
 
     #[test]
     fn test_handle_probe_timeout_returns_timeout_outcome() {
-        let result = run_handle_probe_with_timeout(Duration::from_millis(1), || {
+        let mut worker = HandleProbeWorker::new(|_, _| {
             std::thread::sleep(Duration::from_millis(50));
             Ok(Some("C:\\slow.txt".to_string()))
         });
+        let result = worker.probe(std::process::id(), 1, Duration::from_millis(1));
 
         assert_eq!(result, HandleProbeOutcome::TimedOut);
     }
 
     #[test]
     fn test_handle_probe_worker_panic_returns_panic_outcome() {
-        let result = run_handle_probe_with_timeout(Duration::from_secs(1), || {
+        let mut worker = HandleProbeWorker::new(|_, _| {
             panic!("deliberate handle probe panic");
         });
+        let result = worker.probe(std::process::id(), 1, Duration::from_secs(1));
 
         assert_eq!(result, HandleProbeOutcome::WorkerPanicked);
+    }
+
+    #[test]
+    fn test_handle_probe_worker_reuses_thread_for_multiple_probes() {
+        let mut worker = HandleProbeWorker::new(|_, source_handle| {
+            Ok(Some(format!("C:\\file-{source_handle}.txt")))
+        });
+
+        assert_eq!(
+            worker.probe(std::process::id(), 1, Duration::from_secs(1)),
+            HandleProbeOutcome::Path("C:\\file-1.txt".to_string())
+        );
+        assert_eq!(
+            worker.probe(std::process::id(), 2, Duration::from_secs(1)),
+            HandleProbeOutcome::Path("C:\\file-2.txt".to_string())
+        );
+        assert_eq!(worker.abandoned_workers, 0);
     }
 
     #[test]
