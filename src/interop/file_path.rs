@@ -5,6 +5,14 @@ use windows::Win32::Storage::FileSystem::{
     GETFINALPATHNAMEBYHANDLE_FLAGS, GetFinalPathNameByHandleW,
 };
 
+use super::object::get_object_name;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedFilePath {
+    pub(crate) display_path: String,
+    pub(crate) kernel_path: String,
+}
+
 pub(crate) fn get_final_path_name_by_handle(h_file: &HANDLE) -> WholockResult<String> {
     let mut buf = vec![0u16; 1024];
 
@@ -31,6 +39,13 @@ pub(crate) fn get_final_path_name_by_handle(h_file: &HANDLE) -> WholockResult<St
 
         buf.resize(result + 1, 0);
     }
+}
+
+pub(crate) fn get_file_paths_by_handle(h_file: &HANDLE) -> WholockResult<ResolvedFilePath> {
+    Ok(ResolvedFilePath {
+        display_path: get_final_path_name_by_handle(h_file)?,
+        kernel_path: get_object_name(*h_file).unwrap_or_default(),
+    })
 }
 
 pub(crate) fn strip_extended_path_prefix(path: &str) -> String {
@@ -67,5 +82,20 @@ mod tests {
         assert!(path.contains("test.txt"));
         assert!(path.ends_with("test.txt"));
         assert!(!path.contains('\0'));
+    }
+
+    #[test]
+    fn test_get_file_paths_by_handle() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("resolved.txt");
+        let mut file = File::create(&file_path).unwrap();
+        writeln!(file, "test content").unwrap();
+
+        let file = File::open(&file_path).unwrap();
+        let handle = HANDLE(file.as_raw_handle() as _);
+        let paths = get_file_paths_by_handle(&handle).unwrap();
+
+        assert!(paths.display_path.ends_with("resolved.txt"));
+        assert!(paths.kernel_path.ends_with("resolved.txt"));
     }
 }

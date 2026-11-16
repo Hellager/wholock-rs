@@ -1,6 +1,6 @@
 use crate::{WholockResult, error::WholockError, error::get_win32_error_message};
 use std::{ffi::OsString, mem, os::windows::ffi::OsStringExt};
-use windows::Win32::Foundation::{HMODULE, MAX_PATH, WIN32_ERROR};
+use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HMODULE, MAX_PATH, WIN32_ERROR};
 use windows::Win32::System::ProcessStatus::{EnumProcessModules, GetModuleFileNameExW};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
@@ -12,6 +12,7 @@ use super::file_path::strip_extended_path_prefix;
 use super::handle::SafeHandle;
 
 const INITIAL_MODULE_CAPACITY: usize = 256;
+const MAX_DYNAMIC_PATH_CAPACITY: usize = 32 * 1024;
 
 #[allow(dead_code)]
 pub(crate) fn build_process_name_dict() -> WholockResult<std::collections::HashMap<usize, String>> {
@@ -44,6 +45,72 @@ fn extract_filename(path: &str) -> WholockResult<String> {
         .ok_or_else(|| WholockError::path("Invalid file path"))
 }
 
+fn next_path_capacity(current: usize) -> WholockResult<usize> {
+    if current >= MAX_DYNAMIC_PATH_CAPACITY {
+        return Err(WholockError::other(
+            "Path exceeds the supported Windows limit",
+        ));
+    }
+
+    Ok(current
+        .checked_mul(2)
+        .unwrap_or(MAX_DYNAMIC_PATH_CAPACITY)
+        .min(MAX_DYNAMIC_PATH_CAPACITY))
+}
+
+unsafe fn query_full_process_image_path(
+    handle: windows::Win32::Foundation::HANDLE,
+) -> WholockResult<String> {
+    let mut buffer = vec![0u16; MAX_PATH as usize + 1];
+
+    loop {
+        let mut size = u32::try_from(buffer.len())
+            .map_err(|_| WholockError::other("Process path buffer is too large"))?;
+        // SAFETY: `handle` is a live process handle and `buffer` is writable
+        // for the capacity supplied through `size`.
+        match unsafe {
+            QueryFullProcessImageNameW(
+                handle,
+                windows::Win32::System::Threading::PROCESS_NAME_FORMAT(0),
+                PWSTR::from_raw(buffer.as_mut_ptr()),
+                &mut size,
+            )
+        } {
+            Ok(()) => return convert_wide_buffer(&buffer, size as usize),
+            Err(error) if error.code().0 as u32 == ERROR_INSUFFICIENT_BUFFER.0 => {
+                let required = usize::try_from(size).unwrap_or(0).saturating_add(1);
+                let next = next_path_capacity(buffer.len().max(required))?;
+                buffer.resize(next, 0);
+            }
+            Err(error) => return Err(WIN32_ERROR(error.code().0 as u32).into()),
+        }
+    }
+}
+
+unsafe fn module_path_for_handle(
+    process: windows::Win32::Foundation::HANDLE,
+    module: HMODULE,
+) -> WholockResult<Option<String>> {
+    let mut buffer = vec![0u16; MAX_PATH as usize + 1];
+
+    loop {
+        // SAFETY: `process` and `module` are valid handles from the current
+        // process module enumeration, and `buffer` is writable.
+        let len = unsafe { GetModuleFileNameExW(Some(process), Some(module), &mut buffer) };
+        if len == 0 {
+            return Ok(None);
+        }
+
+        let len = len as usize;
+        if len + 1 < buffer.len() {
+            return convert_wide_buffer(&buffer, len).map(Some);
+        }
+
+        let next = next_path_capacity(buffer.len())?;
+        buffer.resize(next, 0);
+    }
+}
+
 pub(crate) fn get_process_info(pid: u32) -> WholockResult<(String, String)> {
     // SAFETY: OpenProcess returns an owned process handle for `pid` on success
     // and that handle is wrapped in SafeHandle. QueryFullProcessImageNameW
@@ -59,18 +126,7 @@ pub(crate) fn get_process_info(pid: u32) -> WholockResult<(String, String)> {
 
         let safe_handle = SafeHandle::new(handle)?;
 
-        let mut buffer = [0u16; MAX_PATH as usize + 1];
-        let mut size = buffer.len() as u32;
-
-        QueryFullProcessImageNameW(
-            safe_handle.as_raw(),
-            windows::Win32::System::Threading::PROCESS_NAME_FORMAT(0),
-            PWSTR::from_raw(buffer.as_mut_ptr()),
-            &mut size,
-        )
-        .map_err(|e| WholockError::from(WIN32_ERROR(e.code().0 as u32)))?;
-
-        let path_str = convert_wide_buffer(&buffer, size as usize)?;
+        let path_str = query_full_process_image_path(safe_handle.as_raw())?;
         let exe_name = extract_filename(&path_str)?;
 
         Ok((exe_name, path_str))
@@ -137,13 +193,7 @@ pub(crate) fn get_process_module_paths(pid: u32) -> WholockResult<Vec<String>> {
 
         let mut paths = Vec::new();
         for module in modules {
-            let mut buffer = vec![0u16; MAX_PATH as usize + 1];
-            let len = GetModuleFileNameExW(Some(safe_handle.as_raw()), Some(module), &mut buffer);
-            if len == 0 {
-                continue;
-            }
-
-            if let Ok(path) = convert_wide_buffer(&buffer, len as usize) {
+            if let Ok(Some(path)) = module_path_for_handle(safe_handle.as_raw(), module) {
                 if !path.is_empty() {
                     paths.push(strip_extended_path_prefix(&path));
                 }

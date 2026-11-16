@@ -10,6 +10,7 @@ use windows::core::PCWSTR;
 
 use super::file_path::{get_final_path_name_by_handle, strip_extended_path_prefix};
 use super::handle::SafeHandle;
+use super::object::get_object_name;
 
 fn normalize_path(path: &str) -> String {
     let mut path = strip_extended_path_prefix(path.trim_end_matches('\0')).replace('/', "\\");
@@ -65,6 +66,25 @@ pub(crate) fn final_path_for_path(path: &str) -> WholockResult<String> {
     get_final_path_name_by_handle(&raw_handle)
 }
 
+pub(crate) fn kernel_path_for_path(path: &str) -> WholockResult<String> {
+    let path_wide = wide_null(path);
+    // SAFETY: `path_wide` is a null-terminated UTF-16 path buffer that lives
+    // until CreateFileW returns. The returned handle is wrapped in SafeHandle.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path_wide.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            Some(HANDLE::default()),
+        )
+    }?;
+    let handle = SafeHandle::new(handle)?;
+    get_object_name(handle.as_raw())
+}
+
 fn lexical_absolute_path(path: &str) -> String {
     let path = Path::new(path);
     if path.is_absolute() {
@@ -103,9 +123,34 @@ fn directory_match_prefix(path: &str) -> String {
     }
 }
 
+struct PathIdentity {
+    path: String,
+    directory_prefix: Option<String>,
+}
+
+impl PathIdentity {
+    fn new(path: &str, is_directory: bool) -> Self {
+        let path = normalize_path(path);
+        let directory_prefix = is_directory.then(|| directory_match_prefix(&path));
+        Self {
+            path,
+            directory_prefix,
+        }
+    }
+
+    fn matches(&self, path: &str) -> bool {
+        let path = normalize_path(path);
+        windows_ignore_case_eq(&path, &self.path)
+            || self
+                .directory_prefix
+                .as_ref()
+                .is_some_and(|prefix| windows_path_starts_with_ignore_case(&path, prefix))
+    }
+}
+
 pub(crate) struct LockedPathMatcher {
-    target_path: String,
-    target_directory_prefix: Option<String>,
+    display: PathIdentity,
+    kernel: Option<PathIdentity>,
 }
 
 impl LockedPathMatcher {
@@ -116,26 +161,33 @@ impl LockedPathMatcher {
             .or_else(|_| std::fs::metadata(target_path))
             .ok()
             .is_some_and(|metadata| metadata.is_dir());
-        let target_path = normalize_path(&resolved_path);
-        let target_directory_prefix = is_directory.then(|| directory_match_prefix(&target_path));
+        let display = PathIdentity::new(&resolved_path, is_directory);
+        let kernel = kernel_path_for_path(target_path)
+            .or_else(|_| kernel_path_for_path(&resolved_path))
+            .ok()
+            .filter(|path| !path.is_empty())
+            .map(|path| PathIdentity::new(&path, is_directory));
 
-        Self {
-            target_path,
-            target_directory_prefix,
-        }
+        Self { display, kernel }
     }
 
-    fn matches_normalized(&self, path: &str) -> bool {
-        windows_ignore_case_eq(path, &self.target_path)
-            || self
-                .target_directory_prefix
-                .as_ref()
-                .is_some_and(|prefix| windows_path_starts_with_ignore_case(path, prefix))
+    #[cfg(test)]
+    fn matches_display(&self, path: &str) -> bool {
+        self.display.matches(path)
+    }
+
+    fn matches_resolved(&self, display_path: &str, kernel_path: Option<&str>) -> bool {
+        self.display.matches(display_path)
+            || kernel_path.is_some_and(|path| {
+                self.kernel
+                    .as_ref()
+                    .is_some_and(|identity| identity.matches(path))
+            })
     }
 
     #[cfg(test)]
     pub(crate) fn matches(&self, path: &str) -> bool {
-        self.matches_normalized(&normalize_path(path))
+        self.matches_display(path)
     }
 }
 
@@ -163,11 +215,17 @@ impl LockedPathMatchers {
         self.matchers.is_empty()
     }
 
+    #[cfg(test)]
     pub(crate) fn matches(&self, path: &str) -> bool {
-        let path = normalize_path(path);
         self.matchers
             .iter()
-            .any(|matcher| matcher.matches_normalized(&path))
+            .any(|matcher| matcher.matches_display(path))
+    }
+
+    pub(crate) fn matches_resolved(&self, display_path: &str, kernel_path: Option<&str>) -> bool {
+        self.matchers
+            .iter()
+            .any(|matcher| matcher.matches_resolved(display_path, kernel_path))
     }
 }
 
@@ -252,6 +310,19 @@ mod tests {
             targets
         ));
         assert!(check_if_locked_files(&sibling_final_path, targets));
+    }
+
+    #[test]
+    fn test_kernel_path_matches_when_display_path_differs() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("kernel-match.txt");
+        File::create(&file_path).unwrap();
+
+        let file_path = file_path.to_str().unwrap();
+        let kernel_path = kernel_path_for_path(file_path).unwrap();
+        let matchers = LockedPathMatchers::new([file_path]).unwrap();
+
+        assert!(matchers.matches_resolved(r"Z:\alias\kernel-match.txt", Some(&kernel_path)));
     }
 
     #[test]

@@ -2,9 +2,10 @@ use crate::elevation::enable_debug_privilege;
 use crate::error::{LockScanWarning, LockScanWarningKind, WholockError};
 use crate::interop::{
     LockedPathMatchers, PROCESS_ACCESS_RIGHTS_DUP_HANDLE, PROCESS_ACCESS_RIGHTS_QUERY_INFORMATION,
-    SYSTEM_EXTENDED_HANDLE_INFORMATION, duplicate_handle_value, get_final_path_name_by_handle,
-    get_handle_owner_info, get_handle_table, get_process_info, get_process_module_paths,
-    is_file_handle, query_system_information_buffer,
+    ResolvedFilePath, SYSTEM_EXTENDED_HANDLE_INFORMATION, duplicate_handle_value,
+    get_file_paths_by_handle, get_handle_owner_info, get_handle_table, get_process_info,
+    get_process_module_paths, is_file_handle, kernel_path_for_path,
+    query_system_information_buffer,
 };
 use crate::{
     WholockResult,
@@ -53,7 +54,7 @@ impl Drop for HandleWrapper {
 
 #[derive(Debug, PartialEq, Eq)]
 enum HandleProbeOutcome {
-    Path(String),
+    Path(ResolvedFilePath),
     NoMatch,
     TimedOut,
     WorkerLimitReached,
@@ -63,7 +64,7 @@ enum HandleProbeOutcome {
 }
 
 type HandleProbeFunction =
-    dyn Fn(HANDLE, usize) -> WholockResult<Option<String>> + Send + Sync + 'static;
+    dyn Fn(HANDLE, usize) -> WholockResult<Option<ResolvedFilePath>> + Send + Sync + 'static;
 
 struct HandleProbeRequest {
     pid: u32,
@@ -71,7 +72,8 @@ struct HandleProbeRequest {
     reply: mpsc::Sender<HandleProbeReply>,
 }
 
-type HandleProbeReply = Result<WholockResult<Option<String>>, Box<dyn std::any::Any + Send>>;
+type HandleProbeReply =
+    Result<WholockResult<Option<ResolvedFilePath>>, Box<dyn std::any::Any + Send>>;
 
 struct HandleProbeWorker {
     probe: Arc<HandleProbeFunction>,
@@ -82,7 +84,7 @@ struct HandleProbeWorker {
 impl HandleProbeWorker {
     fn new<F>(probe: F) -> Self
     where
-        F: Fn(HANDLE, usize) -> WholockResult<Option<String>> + Send + Sync + 'static,
+        F: Fn(HANDLE, usize) -> WholockResult<Option<ResolvedFilePath>> + Send + Sync + 'static,
     {
         Self {
             probe: Arc::new(probe),
@@ -187,7 +189,7 @@ fn open_handle_owner_process(pid: u32) -> Option<(u32, HandleWrapper)> {
 fn probe_handle_path_blocking(
     handle_owner_process: HANDLE,
     source_handle: usize,
-) -> WholockResult<Option<String>> {
+) -> WholockResult<Option<ResolvedFilePath>> {
     // SAFETY: GetCurrentProcess returns the documented pseudo-handle for the
     // current process. It must not be closed and is only passed to DuplicateHandle.
     let current_process = unsafe { GetCurrentProcess() };
@@ -205,7 +207,7 @@ fn probe_handle_path_blocking(
         return Ok(None);
     }
 
-    Ok(get_final_path_name_by_handle(&dup_handle.get()).ok())
+    Ok(get_file_paths_by_handle(&dup_handle.get()).ok())
 }
 
 struct ProcessLockCollector {
@@ -364,9 +366,11 @@ fn scan_process_handles(
 
     for handle_value in handle_values {
         match probe_worker.probe(pid, *handle_value, handle_probe_timeout) {
-            HandleProbeOutcome::Path(full_name) => {
-                if matchers.matches(&full_name) {
-                    locked_files.insert(full_name);
+            HandleProbeOutcome::Path(paths) => {
+                let kernel_path =
+                    (!paths.kernel_path.is_empty()).then_some(paths.kernel_path.as_str());
+                if matchers.matches_resolved(&paths.display_path, kernel_path) {
+                    locked_files.insert(paths.display_path);
                 }
             }
             HandleProbeOutcome::NoMatch => {}
@@ -594,7 +598,8 @@ where
             };
 
             for module_path in module_paths {
-                if matchers.matches(&module_path) {
+                let kernel_path = kernel_path_for_path(&module_path).ok();
+                if matchers.matches_resolved(&module_path, kernel_path.as_deref()) {
                     result
                         .entry(pid)
                         .or_insert_with(|| ProcessLockCollector::new(pid))
@@ -726,7 +731,10 @@ mod tests {
     fn test_handle_probe_timeout_returns_timeout_outcome() {
         let mut worker = HandleProbeWorker::new(|_, _| {
             std::thread::sleep(Duration::from_millis(50));
-            Ok(Some("C:\\slow.txt".to_string()))
+            Ok(Some(ResolvedFilePath {
+                display_path: "C:\\slow.txt".to_string(),
+                kernel_path: "\\Device\\HarddiskVolume1\\slow.txt".to_string(),
+            }))
         });
         let result = worker.probe(std::process::id(), 1, Duration::from_millis(1));
 
@@ -746,16 +754,25 @@ mod tests {
     #[test]
     fn test_handle_probe_worker_reuses_thread_for_multiple_probes() {
         let mut worker = HandleProbeWorker::new(|_, source_handle| {
-            Ok(Some(format!("C:\\file-{source_handle}.txt")))
+            Ok(Some(ResolvedFilePath {
+                display_path: format!("C:\\file-{source_handle}.txt"),
+                kernel_path: format!("\\Device\\HarddiskVolume1\\file-{source_handle}.txt"),
+            }))
         });
 
         assert_eq!(
             worker.probe(std::process::id(), 1, Duration::from_secs(1)),
-            HandleProbeOutcome::Path("C:\\file-1.txt".to_string())
+            HandleProbeOutcome::Path(ResolvedFilePath {
+                display_path: "C:\\file-1.txt".to_string(),
+                kernel_path: "\\Device\\HarddiskVolume1\\file-1.txt".to_string(),
+            })
         );
         assert_eq!(
             worker.probe(std::process::id(), 2, Duration::from_secs(1)),
-            HandleProbeOutcome::Path("C:\\file-2.txt".to_string())
+            HandleProbeOutcome::Path(ResolvedFilePath {
+                display_path: "C:\\file-2.txt".to_string(),
+                kernel_path: "\\Device\\HarddiskVolume1\\file-2.txt".to_string(),
+            })
         );
         assert_eq!(worker.abandoned_workers, 0);
     }
