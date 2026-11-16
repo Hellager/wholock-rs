@@ -98,9 +98,9 @@ fn main() {
                     println!("Process Name: {}", process.process_name);
                     println!("Executable Path: {}", process.process_exe_path);
                     println!("Owner: {}", process.domain_username);
-                    println!("Locked Files:");
-                    for file in &process.locked_file {
-                        println!("  - {}", file);
+                    println!("Matches:");
+                    for lock_match in &process.matches {
+                        println!("  - {} ({})", lock_match.path, lock_match.source);
                     }
                     println!("{:-<50}", "");
                 }

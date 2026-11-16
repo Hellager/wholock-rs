@@ -4,7 +4,7 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
-use wholock::ProcessInfo;
+use wholock::{LockMatchSource, ProcessInfo};
 use wholock::{unlock_process, unlock_processes, who_locks_file};
 
 const LOCK_HELPER_PATH_ENV: &str = "WHOLOCK_E2E_LOCK_PATH";
@@ -89,6 +89,9 @@ fn test_find_locked_file_by_helper_process() {
             .iter()
             .any(|f| f.contains("locked.txt"))
     );
+    assert!(helper_process.matches.iter().any(|lock_match| {
+        lock_match.path.contains("locked.txt") && lock_match.source == LockMatchSource::FileHandle
+    }));
 
     let unlock_results = unlock_processes(std::slice::from_ref(helper_process));
     assert_eq!(unlock_results.len(), 1);

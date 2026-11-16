@@ -18,6 +18,7 @@ Windows 文件锁定诊断工具包，精准识别锁定文件的进程，并在
 ## 功能特性 ✨
 
 - 🔍 **深度句柄探查** - 通过 NTAPI 枚举系统句柄
+- 🧭 **结构化匹配** - 区分文件句柄与已加载的进程模块
 - 🎯 **精准 PID 定位** - 将句柄映射到具体进程 ID
 - 🔓 **安全解锁控制** - 带安全检查的受控终止
 - 📂 **路径标准化** - 处理 Win32 设备路径转换
@@ -51,7 +52,9 @@ fn main() -> WholockResult<()> {
 
     scan.processes().iter().for_each(|p| {
         println!("🔒 进程 {} (PID: {}) 锁定文件:", p.process_name, p.pid);
-        p.locked_file.iter().for_each(|f| println!("   - {}", f));
+        p.matches
+            .iter()
+            .for_each(|m| println!("   - {} ({})", m.path, m.source));
     });
 
     for result in unlock_processes(scan.processes()) {
@@ -83,8 +86,8 @@ fn main() -> WholockResult<()> {
 
     for process in scan.processes() {
         println!("进程 {} (PID: {}) 锁定文件:", process.process_name, process.pid);
-        for file in &process.locked_file {
-            println!("   - {}", file);
+        for lock_match in &process.matches {
+            println!("   - {} ({})", lock_match.path, lock_match.source);
         }
     }
 

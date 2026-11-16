@@ -9,7 +9,7 @@
 //! ### Core Operations
 //! - Identify processes locking one file with [`who_locks_file`]
 //! - Scan one or more files or directories with [`scan_locks`]
-//! - Return process identity, owner, executable path, and matching locked paths
+//! - Return process identity, owner, executable path, and structured match evidence
 //! - Wait until matching locks disappear
 //!
 //! ### Advanced Management
@@ -32,8 +32,8 @@
 //!
 //!     for process in scan.processes() {
 //!         println!("PID {}: {}", process.pid, process.process_name);
-//!         for path in &process.locked_file {
-//!             println!("  - {}", path);
+//!         for lock_match in &process.matches {
+//!             println!("  - {} ({})", lock_match.path, lock_match.source);
 //!         }
 //!     }
 //!
@@ -89,6 +89,7 @@
 //! ## Implementation Details
 //!
 //! - Uses Windows NT handle enumeration and process module inspection
+//! - Distinguishes open file handles from loaded process module matches
 //! - Protects potentially blocking handle probes with caller-configurable timeouts
 //! - Preserves recoverable scan failures as [`error::LockScanWarning`] values
 //!
@@ -125,8 +126,9 @@ pub type WholockResult<T> = Result<T, WholockError>;
 pub use elevation::{enable_debug_privilege, is_process_elevated};
 pub use scan::{scan_locks, who_locks_file};
 pub use types::{
-    LockScanOptions, LockScanResult, ProcessInfo, ProcessTerminationFailure,
-    ProcessTerminationFailureKind, UnlockProcessResult, WaitForUnlockResult,
+    LockMatch, LockMatchSource, LockScanOptions, LockScanResult, ProcessInfo,
+    ProcessTerminationFailure, ProcessTerminationFailureKind, UnlockProcessResult,
+    WaitForUnlockResult,
 };
 pub use unlock::{unlock_process, unlock_processes};
 pub use wait::{wait_for_unlock, wait_for_unlock_files};

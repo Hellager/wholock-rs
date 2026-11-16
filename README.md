@@ -19,6 +19,7 @@ Inspired by PowerToys [File Locksmith](https://github.com/microsoft/PowerToys?ta
 ## Features ✨
 
 - 🔍 **Deep Handle Inspection** - Enumerate system handles with NTAPI
+- 🧭 **Structured Matches** - Distinguish file handles from loaded process modules
 - 🎯 **Precise PID Targeting** - Map handles to exact process IDs
 - 🔓 **Controlled Unlocking** - Checked termination with safety checks
 - 📂 **Path Normalization** - Handle Win32 device path conversions
@@ -53,7 +54,9 @@ fn main() -> WholockResult<()> {
   
     scan.processes().iter().for_each(|p| {
         println!("🔒 Process {} (PID: {}) locks:", p.process_name, p.pid);
-        p.locked_file.iter().for_each(|f| println!("   - {}", f));
+        p.matches
+            .iter()
+            .for_each(|m| println!("   - {} ({})", m.path, m.source));
     });
 
     for result in unlock_processes(scan.processes()) {
@@ -85,8 +88,8 @@ fn main() -> WholockResult<()> {
 
     for process in scan.processes() {
         println!("Process {} (PID: {}) locks:", process.process_name, process.pid);
-        for file in &process.locked_file {
-            println!("   - {}", file);
+        for lock_match in &process.matches {
+            println!("   - {} ({})", lock_match.path, lock_match.source);
         }
     }
 

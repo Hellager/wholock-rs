@@ -160,6 +160,7 @@ mod tests {
             process_exe_path: String::new(),
             domain_username: String::new(),
             locked_file: Vec::new(),
+            matches: Vec::new(),
             process_instance_id: None,
         }
     }

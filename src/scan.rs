@@ -9,7 +9,7 @@ use crate::interop::{
 };
 use crate::{
     WholockResult,
-    types::{LockScanOptions, LockScanResult, ProcessInfo},
+    types::{LockMatch, LockMatchSource, LockScanOptions, LockScanResult, ProcessInfo},
 };
 use itertools::Itertools;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -214,23 +214,23 @@ fn probe_handle_path_blocking(
 
 struct ProcessLockCollector {
     pid: u32,
-    locked_files: BTreeSet<String>,
+    matches: BTreeSet<LockMatch>,
 }
 
 impl ProcessLockCollector {
     fn new(pid: u32) -> Self {
         Self {
             pid,
-            locked_files: BTreeSet::new(),
+            matches: BTreeSet::new(),
         }
     }
 
-    fn with_locked_files(pid: u32, locked_files: BTreeSet<String>) -> Self {
-        Self { pid, locked_files }
+    fn with_matches(pid: u32, matches: BTreeSet<LockMatch>) -> Self {
+        Self { pid, matches }
     }
 
-    fn insert_path(&mut self, path: String) {
-        self.locked_files.insert(path);
+    fn insert_match(&mut self, path: String, source: LockMatchSource) {
+        self.matches.insert(LockMatch::new(path, source));
     }
 
     fn into_process_info(self, warnings: &mut Vec<LockScanWarning>) -> ProcessInfo {
@@ -260,12 +260,21 @@ impl ProcessLockCollector {
                 }
             };
 
+        let matches = self.matches.into_iter().collect::<Vec<_>>();
+        let locked_file = matches
+            .iter()
+            .map(|lock_match| lock_match.path.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
         ProcessInfo {
             pid: self.pid,
             process_name,
             process_exe_path,
             domain_username,
-            locked_file: self.locked_files.into_iter().collect(),
+            locked_file,
+            matches,
             process_instance_id,
         }
     }
@@ -408,7 +417,7 @@ fn scan_process_handles(
         };
     }
 
-    let mut locked_files = BTreeSet::new();
+    let mut matches = BTreeSet::new();
     let mut warnings = Vec::new();
     let mut probe_failures = Vec::new();
     let mut kernel_path_failures = Vec::new();
@@ -420,7 +429,10 @@ fn scan_process_handles(
                     kernel_path_failures.push(format!("handle {handle_value:#x}: {error}"));
                 }
                 if matchers.matches_resolved(&paths.display_path, paths.kernel_path.as_deref()) {
-                    locked_files.insert(paths.display_path);
+                    matches.insert(LockMatch::new(
+                        paths.display_path,
+                        LockMatchSource::FileHandle,
+                    ));
                 }
             }
             HandleProbeOutcome::NoMatch => {}
@@ -489,7 +501,7 @@ fn scan_process_handles(
         ));
     }
 
-    if locked_files.is_empty() {
+    if matches.is_empty() {
         return ProcessHandleScanResult {
             process_info: None,
             warnings,
@@ -497,7 +509,7 @@ fn scan_process_handles(
     }
 
     ProcessHandleScanResult::with_process_info(
-        ProcessLockCollector::with_locked_files(pid, locked_files),
+        ProcessLockCollector::with_matches(pid, matches),
         warnings,
     )
 }
@@ -614,7 +626,9 @@ fn handle_table_warning(err: WholockError) -> LockScanWarning {
 /// # Returns
 ///
 /// Returns [`LockScanResult`] with discovered processes and recoverable scan warnings.
-/// Use [`LockScanResult::is_complete`] to check whether any warnings occurred.
+/// Each [`ProcessInfo`] includes structured matches that distinguish open file handles
+/// from loaded process modules. Use [`LockScanResult::is_complete`] to check whether
+/// any warnings occurred.
 ///
 /// # Errors
 ///
@@ -630,6 +644,9 @@ fn handle_table_warning(err: WholockError) -> LockScanWarning {
 ///
 /// for process in scan.processes() {
 ///     println!("PID {}: {}", process.pid, process.process_name);
+///     for lock_match in &process.matches {
+///         println!("  {} ({})", lock_match.path, lock_match.source);
+///     }
 /// }
 /// # Ok::<(), wholock::error::WholockError>(())
 /// ```
@@ -705,7 +722,7 @@ where
                     result
                         .entry(pid)
                         .or_insert_with(|| ProcessLockCollector::new(pid))
-                        .insert_path(module_path);
+                        .insert_match(module_path, LockMatchSource::ProcessModule);
                 }
             }
 
@@ -827,6 +844,70 @@ mod tests {
         assert!(result.processes().is_empty());
         assert_eq!(result.warnings().len(), 1);
         assert!(!result.is_complete_success());
+    }
+
+    #[test]
+    fn test_process_info_preserves_structured_match_sources() {
+        let path = r"C:\data\plugin.dll".to_string();
+        let mut collector = ProcessLockCollector::new(std::process::id());
+        collector.insert_match(path.clone(), LockMatchSource::FileHandle);
+        collector.insert_match(path.clone(), LockMatchSource::ProcessModule);
+        collector.insert_match(path.clone(), LockMatchSource::FileHandle);
+
+        let process = collector.into_process_info(&mut Vec::new());
+
+        assert_eq!(process.locked_file, vec![path]);
+        assert_eq!(process.matches.len(), 2);
+        assert!(
+            process
+                .matches
+                .iter()
+                .any(|lock_match| lock_match.source == LockMatchSource::FileHandle)
+        );
+        assert!(
+            process
+                .matches
+                .iter()
+                .any(|lock_match| lock_match.source == LockMatchSource::ProcessModule)
+        );
+    }
+
+    #[test]
+    fn test_handle_scan_reports_file_handle_match_source() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        File::create(&target).unwrap();
+        let target = target.to_string_lossy().to_string();
+        let matchers = LockedPathMatchers::new([target.as_str()]).unwrap();
+        let worker_path = target.clone();
+        let mut worker = HandleProbeWorker::new(move |_, _| {
+            Ok(Some(ResolvedFilePath {
+                display_path: worker_path.clone(),
+                kernel_path: None,
+                kernel_path_error: None,
+            }))
+        });
+
+        let result = scan_process_handles(
+            std::process::id(),
+            &[0x2a],
+            &matchers,
+            Duration::from_secs(1),
+            &mut worker,
+        );
+        let process = result
+            .process_info
+            .expect("handle match should be returned");
+
+        assert_eq!(process.matches.len(), 1);
+        assert_eq!(
+            process
+                .matches
+                .iter()
+                .next()
+                .map(|lock_match| lock_match.source),
+            Some(LockMatchSource::FileHandle)
+        );
     }
 
     #[test]
@@ -1064,11 +1145,16 @@ mod tests {
             .find(|process| process.pid == std::process::id())
             .expect("current process should hold the open file");
         assert!(!current_process.locked_file.is_empty());
+        assert!(!current_process.matches.is_empty());
         assert!(
             current_process
                 .locked_file
                 .iter()
                 .any(|f| f.contains("locked.txt"))
         );
+        assert!(current_process.matches.iter().any(|lock_match| {
+            lock_match.path.contains("locked.txt")
+                && lock_match.source == LockMatchSource::FileHandle
+        }));
     }
 }

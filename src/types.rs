@@ -2,9 +2,44 @@ use crate::{
     WholockResult,
     error::{LockScanWarning, WholockError},
 };
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
-/// Describes a process that currently holds one or more matching file locks.
+/// Identifies how a matching path was associated with a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum LockMatchSource {
+    /// The process owns an open file handle for the matching path.
+    FileHandle,
+    /// The matching path is loaded as a module in the process.
+    ProcessModule,
+}
+
+impl fmt::Display for LockMatchSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FileHandle => f.write_str("file handle"),
+            Self::ProcessModule => f.write_str("process module"),
+        }
+    }
+}
+
+/// Structured evidence that associates a process with a matching path.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub struct LockMatch {
+    /// Display path of the matched file or module.
+    pub path: String,
+    /// Scan source that reported the match.
+    pub source: LockMatchSource,
+}
+
+impl LockMatch {
+    pub(crate) fn new(path: String, source: LockMatchSource) -> Self {
+        Self { path, source }
+    }
+}
+
+/// Describes a process with matching open file handles or loaded modules.
 ///
 /// Values are returned by [`who_locks_file`](crate::who_locks_file) and
 /// [`scan_locks`](crate::scan_locks). Scan results retain private process-instance
@@ -20,8 +55,12 @@ pub struct ProcessInfo {
     pub process_exe_path: String,
     /// Domain-qualified user name that owns the process token when available.
     pub domain_username: String,
-    /// Matching file or module paths held by the process.
+    /// Unique matching file or module paths associated with the process.
+    ///
+    /// This compatibility list contains each unique path from [`ProcessInfo::matches`].
     pub locked_file: Vec<String>,
+    /// Structured file-handle and process-module matches discovered by the scan.
+    pub matches: Vec<LockMatch>,
     /// Opaque Windows process creation value used to reject reused PIDs.
     pub(crate) process_instance_id: Option<u64>,
 }
@@ -117,7 +156,7 @@ impl LockScanOptions {
 /// privilege, that may make the result incomplete.
 #[derive(Debug, Clone)]
 pub struct LockScanResult {
-    /// Processes that matched the requested locked paths.
+    /// Processes that matched the requested paths.
     processes: Vec<ProcessInfo>,
     /// Recoverable scan failures that may have hidden additional lock holders.
     warnings: Vec<LockScanWarning>,
@@ -133,7 +172,7 @@ impl LockScanResult {
         }
     }
 
-    /// Processes that matched the requested locked paths.
+    /// Processes that matched the requested paths.
     #[must_use]
     pub fn processes(&self) -> &[ProcessInfo] {
         &self.processes
@@ -337,6 +376,10 @@ mod tests {
             process_exe_path: String::new(),
             domain_username: String::new(),
             locked_file: vec![format!(r"C:\data\locked-{pid}.txt")],
+            matches: vec![LockMatch::new(
+                format!(r"C:\data\locked-{pid}.txt"),
+                LockMatchSource::FileHandle,
+            )],
             process_instance_id: None,
         }
     }
@@ -421,6 +464,18 @@ mod tests {
             warning.to_string(),
             "PID 42 module enumeration warning: access denied"
         );
+    }
+
+    #[test]
+    fn test_lock_match_preserves_path_and_source() {
+        let lock_match = LockMatch::new(
+            r"C:\data\plugin.dll".to_string(),
+            LockMatchSource::ProcessModule,
+        );
+
+        assert_eq!(lock_match.path, r"C:\data\plugin.dll");
+        assert_eq!(lock_match.source, LockMatchSource::ProcessModule);
+        assert_eq!(lock_match.source.to_string(), "process module");
     }
 
     #[test]

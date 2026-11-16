@@ -197,7 +197,21 @@ fn process_identity_matches_snapshot(
 fn process_still_holds_snapshot_locks(
     process: &ProcessInfo,
 ) -> Result<(), ProcessTerminationFailure> {
-    if process.locked_file.is_empty() {
+    let matched_paths = if process.matches.is_empty() {
+        process
+            .locked_file
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+    } else {
+        process
+            .matches
+            .iter()
+            .map(|lock_match| lock_match.path.as_str())
+            .collect::<BTreeSet<_>>()
+    };
+
+    if matched_paths.is_empty() {
         return Err(ProcessTerminationFailure {
             pid: process.pid,
             kind: ProcessTerminationFailureKind::LockVerification,
@@ -205,14 +219,12 @@ fn process_still_holds_snapshot_locks(
         });
     }
 
-    let current_locks = scan_locks(
-        process.locked_file.iter().map(String::as_str),
-        LockScanOptions::new(),
-    )
-    .map_err(|err| ProcessTerminationFailure {
-        pid: process.pid,
-        kind: ProcessTerminationFailureKind::LockVerification,
-        reason: err.to_string(),
+    let current_locks = scan_locks(matched_paths, LockScanOptions::new()).map_err(|err| {
+        ProcessTerminationFailure {
+            pid: process.pid,
+            kind: ProcessTerminationFailureKind::LockVerification,
+            reason: err.to_string(),
+        }
     })?;
 
     if current_locks
@@ -380,6 +392,7 @@ pub fn unlock_processes(processes: &[ProcessInfo]) -> Vec<UnlockProcessResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{LockMatch, LockMatchSource};
 
     fn process_snapshot(
         pid: u32,
@@ -393,6 +406,10 @@ mod tests {
             process_exe_path: process_exe_path.to_string(),
             domain_username: String::new(),
             locked_file: vec![r"C:\data\locked.txt".to_string()],
+            matches: vec![LockMatch::new(
+                r"C:\data\locked.txt".to_string(),
+                LockMatchSource::FileHandle,
+            )],
             process_instance_id,
         }
     }
@@ -530,6 +547,7 @@ mod tests {
     fn test_process_still_holds_snapshot_locks_rejects_empty_snapshot() {
         let mut process = process_snapshot(std::process::id(), "", "", Some(100));
         process.locked_file.clear();
+        process.matches.clear();
 
         let result = process_still_holds_snapshot_locks(&process);
 
