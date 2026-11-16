@@ -3,7 +3,9 @@ use std::{ffi::OsString, mem, os::windows::ffi::OsStringExt};
 use windows::Win32::Foundation::{
     ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE, HMODULE, MAX_PATH, WIN32_ERROR,
 };
-use windows::Win32::System::ProcessStatus::{EnumProcessModules, GetModuleFileNameExW};
+use windows::Win32::System::ProcessStatus::{
+    EnumProcessModules, EnumProcesses, GetModuleFileNameExW,
+};
 use windows::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_VM_READ, QueryFullProcessImageNameW,
@@ -14,6 +16,8 @@ use super::file_path::strip_extended_path_prefix;
 use super::handle::SafeHandle;
 
 const INITIAL_MODULE_CAPACITY: usize = 256;
+const INITIAL_PROCESS_ID_CAPACITY: usize = 1024;
+const MAX_PROCESS_ID_CAPACITY: usize = 1024 * 1024;
 const MAX_DYNAMIC_PATH_CAPACITY: usize = 32 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +186,48 @@ fn module_count_from_needed_bytes(needed: u32) -> usize {
     (needed as usize).div_ceil(module_size)
 }
 
+pub(crate) fn get_process_ids() -> WholockResult<Vec<u32>> {
+    let mut process_ids = vec![0u32; INITIAL_PROCESS_ID_CAPACITY];
+
+    loop {
+        let buffer_bytes = process_ids
+            .len()
+            .checked_mul(mem::size_of::<u32>())
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or_else(|| WholockError::other("Process ID buffer is too large"))?;
+        let mut needed = 0u32;
+
+        // SAFETY: `process_ids` is a writable array with `buffer_bytes` bytes,
+        // and `needed` points to a valid writable DWORD for the returned size.
+        unsafe {
+            EnumProcesses(process_ids.as_mut_ptr(), buffer_bytes, &mut needed)?;
+        }
+
+        if needed < buffer_bytes {
+            let process_count = needed as usize / mem::size_of::<u32>();
+            process_ids.truncate(process_count);
+            process_ids.retain(|pid| *pid != 0);
+            process_ids.sort_unstable();
+            process_ids.dedup();
+            return Ok(process_ids);
+        }
+
+        if process_ids.len() >= MAX_PROCESS_ID_CAPACITY {
+            return Err(WholockError::other(
+                "Process ID enumeration exceeded the supported limit",
+            ));
+        }
+
+        process_ids.resize(
+            process_ids
+                .len()
+                .saturating_mul(2)
+                .min(MAX_PROCESS_ID_CAPACITY),
+            0,
+        );
+    }
+}
+
 pub(crate) fn get_process_module_paths(pid: u32) -> WholockResult<Vec<String>> {
     // SAFETY: OpenProcess returns an owned process handle for `pid` on success
     // and SafeHandle closes it. EnumProcessModules and GetModuleFileNameExW are
@@ -310,6 +356,14 @@ mod tests {
                 .to_str()
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn test_process_ids_include_current_process() {
+        let process_ids = get_process_ids().unwrap();
+
+        assert!(process_ids.contains(&std::process::id()));
+        assert!(process_ids.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[test]

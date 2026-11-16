@@ -22,24 +22,11 @@ fn normalize_path(path: &str) -> String {
     path
 }
 
-fn windows_ignore_case_eq(left: &str, right: &str) -> bool {
-    let left = left.encode_utf16().collect::<Vec<_>>();
-    let right = right.encode_utf16().collect::<Vec<_>>();
-    windows_ignore_case_eq_wide(&left, &right)
-}
-
 fn windows_ignore_case_eq_wide(left: &[u16], right: &[u16]) -> bool {
     // SAFETY: Both slices are valid UTF-16 buffers for the duration of the call.
     // CompareStringOrdinal only reads from them and the final argument requests
     // documented case-insensitive ordinal comparison.
     unsafe { CompareStringOrdinal(left, right, true) == CSTR_EQUAL }
-}
-
-fn windows_path_starts_with_ignore_case(path: &str, prefix: &str) -> bool {
-    let path = path.encode_utf16().collect::<Vec<_>>();
-    let prefix = prefix.encode_utf16().collect::<Vec<_>>();
-
-    path.len() >= prefix.len() && windows_ignore_case_eq_wide(&path[..prefix.len()], &prefix)
 }
 
 pub(crate) fn wide_null(path: &str) -> Vec<u16> {
@@ -124,27 +111,36 @@ fn directory_match_prefix(path: &str) -> String {
 }
 
 struct PathIdentity {
-    path: String,
-    directory_prefix: Option<String>,
+    path: Vec<u16>,
+    directory_prefix: Option<Vec<u16>>,
 }
 
 impl PathIdentity {
     fn new(path: &str, is_directory: bool) -> Self {
         let path = normalize_path(path);
-        let directory_prefix = is_directory.then(|| directory_match_prefix(&path));
+        let directory_prefix = is_directory.then(|| {
+            directory_match_prefix(&path)
+                .encode_utf16()
+                .collect::<Vec<_>>()
+        });
         Self {
-            path,
+            path: path.encode_utf16().collect(),
             directory_prefix,
         }
     }
 
+    #[cfg(test)]
     fn matches(&self, path: &str) -> bool {
-        let path = normalize_path(path);
-        windows_ignore_case_eq(&path, &self.path)
-            || self
-                .directory_prefix
-                .as_ref()
-                .is_some_and(|prefix| windows_path_starts_with_ignore_case(&path, prefix))
+        let path = normalize_path(path).encode_utf16().collect::<Vec<_>>();
+        self.matches_normalized(&path)
+    }
+
+    fn matches_normalized(&self, path: &[u16]) -> bool {
+        windows_ignore_case_eq_wide(path, &self.path)
+            || self.directory_prefix.as_ref().is_some_and(|prefix| {
+                path.len() >= prefix.len()
+                    && windows_ignore_case_eq_wide(&path[..prefix.len()], prefix)
+            })
     }
 }
 
@@ -174,15 +170,6 @@ impl LockedPathMatcher {
     #[cfg(test)]
     fn matches_display(&self, path: &str) -> bool {
         self.display.matches(path)
-    }
-
-    fn matches_resolved(&self, display_path: &str, kernel_path: Option<&str>) -> bool {
-        self.display.matches(display_path)
-            || kernel_path.is_some_and(|path| {
-                self.kernel
-                    .as_ref()
-                    .is_some_and(|identity| identity.matches(path))
-            })
     }
 
     #[cfg(test)]
@@ -215,6 +202,22 @@ impl LockedPathMatchers {
         self.matchers.is_empty()
     }
 
+    pub(crate) fn kernel_paths_complete(&self) -> bool {
+        self.matchers.iter().all(|matcher| matcher.kernel.is_some())
+    }
+
+    pub(crate) fn matches_kernel(&self, kernel_path: &str) -> bool {
+        let kernel_path = normalize_path(kernel_path)
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        self.matchers.iter().any(|matcher| {
+            matcher
+                .kernel
+                .as_ref()
+                .is_some_and(|identity| identity.matches_normalized(&kernel_path))
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn matches(&self, path: &str) -> bool {
         self.matchers
@@ -223,9 +226,29 @@ impl LockedPathMatchers {
     }
 
     pub(crate) fn matches_resolved(&self, display_path: &str, kernel_path: Option<&str>) -> bool {
-        self.matchers
+        let display_path = normalize_path(display_path)
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        if self
+            .matchers
             .iter()
-            .any(|matcher| matcher.matches_resolved(display_path, kernel_path))
+            .any(|matcher| matcher.display.matches_normalized(&display_path))
+        {
+            return true;
+        }
+
+        let Some(kernel_path) = kernel_path else {
+            return false;
+        };
+        let kernel_path = normalize_path(kernel_path)
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        self.matchers.iter().any(|matcher| {
+            matcher
+                .kernel
+                .as_ref()
+                .is_some_and(|identity| identity.matches_normalized(&kernel_path))
+        })
     }
 }
 
@@ -322,6 +345,8 @@ mod tests {
         let kernel_path = kernel_path_for_path(file_path).unwrap();
         let matchers = LockedPathMatchers::new([file_path]).unwrap();
 
+        assert!(matchers.kernel_paths_complete());
+        assert!(matchers.matches_kernel(&kernel_path));
         assert!(matchers.matches_resolved(r"Z:\alias\kernel-match.txt", Some(&kernel_path)));
     }
 

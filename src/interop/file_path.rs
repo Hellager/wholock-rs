@@ -5,6 +5,7 @@ use windows::Win32::Storage::FileSystem::{
     GETFINALPATHNAMEBYHANDLE_FLAGS, GetFinalPathNameByHandleW,
 };
 
+#[cfg(test)]
 use super::object::get_object_name;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +43,8 @@ pub(crate) fn get_final_path_name_by_handle(h_file: &HANDLE) -> WholockResult<St
     }
 }
 
-pub(crate) fn get_file_paths_by_handle(h_file: &HANDLE) -> WholockResult<ResolvedFilePath> {
+#[cfg(test)]
+fn get_file_paths_by_handle(h_file: &HANDLE) -> WholockResult<ResolvedFilePath> {
     let (kernel_path, kernel_path_error) = match get_object_name(*h_file) {
         Ok(path) => (Some(path), None),
         Err(err) => (None, Some(err.to_string())),
