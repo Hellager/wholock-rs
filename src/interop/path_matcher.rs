@@ -134,12 +134,6 @@ impl PathIdentity {
         }
     }
 
-    #[cfg(test)]
-    fn matches(&self, path: &str) -> bool {
-        let path = normalize_path(path).encode_utf16().collect::<Vec<_>>();
-        self.matches_normalized(&path)
-    }
-
     fn matches_normalized(&self, path: &[u16]) -> bool {
         windows_ignore_case_eq_wide(path, &self.path)
             || self.directory_prefix.as_ref().is_some_and(|prefix| {
@@ -175,6 +169,7 @@ impl PathIdentity {
 
 pub(crate) struct LockedPathMatcher {
     display: PathIdentity,
+    display_aliases: Vec<PathIdentity>,
     kernel: Option<PathIdentity>,
     file_identity: Option<FileIdentity>,
 }
@@ -187,7 +182,15 @@ impl LockedPathMatcher {
             .or_else(|_| std::fs::metadata(target_path))
             .ok()
             .is_some_and(|metadata| metadata.is_dir());
-        let display = PathIdentity::new(&resolved_path, is_directory);
+        // Keep the caller's spelling as the primary display path. Windows may
+        // resolve an 8.3 alias (for example, `RUNNER~1`) to a different long
+        // path, so retain the resolved spelling as a matching alias as well.
+        let display_path = lexical_absolute_path(target_path);
+        let display = PathIdentity::new(&display_path, is_directory);
+        let display_aliases = (normalize_path(&display_path) != normalize_path(&resolved_path))
+            .then(|| PathIdentity::new(&resolved_path, is_directory))
+            .into_iter()
+            .collect();
         let kernel = kernel_path_for_path(target_path)
             .or_else(|_| kernel_path_for_path(&resolved_path))
             .ok()
@@ -199,14 +202,24 @@ impl LockedPathMatcher {
 
         Self {
             display,
+            display_aliases,
             kernel,
             file_identity,
         }
     }
 
+    fn matches_display_normalized(&self, path: &[u16]) -> bool {
+        self.display.matches_normalized(path)
+            || self
+                .display_aliases
+                .iter()
+                .any(|alias| alias.matches_normalized(path))
+    }
+
     #[cfg(test)]
     fn matches_display(&self, path: &str) -> bool {
-        self.display.matches(path)
+        let path = normalize_path(path).encode_utf16().collect::<Vec<_>>();
+        self.matches_display_normalized(&path)
     }
 
     #[cfg(test)]
@@ -312,7 +325,7 @@ impl LockedPathMatchers {
         if self
             .matchers
             .iter()
-            .any(|matcher| matcher.display.matches_normalized(&display_path))
+            .any(|matcher| matcher.matches_display_normalized(&display_path))
         {
             return true;
         }
