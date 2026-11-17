@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-11-17
+
+### Added
+
+- Added structured lock-match evidence that distinguishes open file handles from loaded process
+  modules.
+- Added detailed, displayable scan warnings with completeness tracking for partial scans.
+- Added Windows integration coverage for long paths, UNC paths, mapped drives, junctions,
+  symbolic links, hard links, delete-pending files, module-only locks, process exits, PID reuse,
+  and termination races.
+
+### Changed
+
+- Unified NT kernel-path matching with Win32 path fallback and bounded dynamic buffers for long
+  process, module, and object names.
+- Reused handle-probe workers, cached process handles during scans, restricted probing to disk
+  handles, and enforced a global timeout budget to reduce scan overhead and resource leaks.
+- Updated wait operations to avoid confirming unlocks after incomplete scans and to retain
+  actionable diagnostics.
+- Revalidated process identity and lock state through the opened process handle before termination
+  to prevent PID-reuse races.
+- Replaced `itertools` and `sysinfo` with standard-library and Windows APIs, reducing runtime
+  dependencies.
+
+### Fixed
+
+- Preserved and aggregated path-resolution, process-access, metadata, module, and worker failures
+  instead of silently dropping partial scan context.
+- Preserved invalid-PID reporting when a process exits between scanning and unlocking.
+
 ## [0.1.1] - 2026-06-25
 
 ### Added

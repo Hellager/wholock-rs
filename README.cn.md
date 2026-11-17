@@ -30,7 +30,7 @@ Windows 文件锁定诊断工具包，精准识别锁定文件的进程，并在
 
 ```toml
 [dependencies]
-wholock = "0.1.1"
+wholock = "0.1.2"
 ```
 
 *要求 Windows 10+ 和 Rust 1.85+*
