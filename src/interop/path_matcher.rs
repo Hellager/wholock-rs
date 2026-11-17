@@ -1,6 +1,6 @@
 use crate::{WholockResult, error::WholockError};
 use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::Path};
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{HANDLE, MAX_PATH};
 use windows::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -32,8 +32,35 @@ fn windows_ignore_case_eq_wide(left: &[u16], right: &[u16]) -> bool {
     unsafe { CompareStringOrdinal(left, right, true) == CSTR_EQUAL }
 }
 
+fn path_for_windows_api(path: &str) -> String {
+    let path = path.replace('/', "\\");
+    if path.starts_with(r"\\?\") || path.starts_with(r"\\.\") {
+        return path;
+    }
+
+    let path =
+        if path.encode_utf16().count() >= MAX_PATH as usize && !Path::new(&path).is_absolute() {
+            lexical_absolute_path(&path)
+        } else {
+            path
+        };
+
+    if path.encode_utf16().count() < MAX_PATH as usize {
+        return path;
+    }
+
+    if let Some(unc_path) = path.strip_prefix(r"\\") {
+        format!(r"\\?\UNC\{unc_path}")
+    } else {
+        format!(r"\\?\{path}")
+    }
+}
+
 pub(crate) fn wide_null(path: &str) -> Vec<u16> {
-    path.encode_utf16().chain(std::iter::once(0)).collect()
+    path_for_windows_api(path)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 pub(crate) fn final_path_for_path(path: &str) -> WholockResult<String> {
